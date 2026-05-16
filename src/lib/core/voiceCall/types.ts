@@ -145,6 +145,30 @@ export type VoiceCallEndReason =
  */
 export type RenegotiationState = 'idle' | 'outgoing' | 'incoming' | 'glare';
 
+/**
+ * Internal trigger for an in-flight kind-25055 Call Renegotiate. Used
+ * for diagnostics only — the wire format of an ICE-restart kind-25055
+ * is byte-equivalent to a media-change kind-25055 and the receiver
+ * cannot distinguish the two.
+ *
+ * - `'media'`: voice→video upgrade or any other media-kind change.
+ * - `'ice-restart'`: ICE-restart attempt fired after FAILED (or after
+ *   the disconnected-grace timer expires).
+ * - `null`: no renegotiation in flight (paired with
+ *   {@link RenegotiationState} of `'idle'`).
+ */
+export type RenegotiationTrigger = 'media' | 'ice-restart' | null;
+
+/**
+ * Connection-quality signal driving the "Reconnecting…" UI pill. Set
+ * to `'reconnecting'` while ICE is transient-disconnected (within the
+ * grace window) OR while an ICE restart is in flight OR while a
+ * deferred ICE restart is pending. Restored to `'good'` immediately on
+ * `iceConnectionState` reaching `connected`/`completed`, or when the
+ * call (or, in a group call, that participant's edge) ends.
+ */
+export type ConnectionQuality = 'good' | 'reconnecting';
+
 export interface VoiceCallState {
     status: VoiceCallStatus;
     peerNpub: string | null;
@@ -170,6 +194,16 @@ export interface VoiceCallState {
      * `status` is `'idle'` or `'ended'`.
      */
     renegotiationState: RenegotiationState;
+    /**
+     * Internal trigger for the in-flight kind-25055 renegotiation. See
+     * {@link RenegotiationTrigger}. Diagnostics-only; never on the wire.
+     */
+    renegotiationTrigger: RenegotiationTrigger;
+    /**
+     * Connection-quality signal driving the "Reconnecting…" UI pill.
+     * See {@link ConnectionQuality}. Default `'good'`.
+     */
+    connectionQuality: ConnectionQuality;
 }
 
 /**
@@ -578,6 +612,13 @@ export interface ParticipantState {
     pcStatus: ParticipantPcStatus;
     /** End reason once {@code pcStatus === 'ended'}; null otherwise. */
     endReason: VoiceCallEndReason | null;
+    /**
+     * Per-edge connection-quality signal. See {@link ConnectionQuality}.
+     * Default `'good'`. Set to `'reconnecting'` independently per edge
+     * while that edge is in the disconnected-grace window OR while a
+     * per-edge ICE restart is in flight.
+     */
+    connectionQuality: ConnectionQuality;
 }
 
 /**

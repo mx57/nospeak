@@ -227,6 +227,14 @@ public class ActiveCallActivity extends Activity {
      */
     private NativeVoiceCallManager.RenegotiationState latestRenegotiationState =
         NativeVoiceCallManager.RenegotiationState.IDLE;
+    /**
+     * Latest connection-quality signal (mirror of
+     * {@code NativeVoiceCallManager.getConnectionQuality()}). When
+     * equal to {@code "reconnecting"} the status text shows the
+     * "Reconnecting…" label instead of the live duration / connecting
+     * spinner. Surfaced from {@code add-ice-restart-on-failed}.
+     */
+    private String latestConnectionQuality = "good";
     private final Runnable hideChromeRunnable = this::hideChrome;
     private AccessibilityManager.TouchExplorationStateChangeListener a11yListener;
 
@@ -281,6 +289,11 @@ public class ActiveCallActivity extends Activity {
             public void onRenegotiationStateChanged(
                     NativeVoiceCallManager.RenegotiationState state) {
                 mainHandler.post(() -> applyRenegotiationState(state));
+            }
+
+            @Override
+            public void onConnectionQualityChanged(String quality) {
+                mainHandler.post(() -> applyConnectionQuality(quality));
             }
         };
 
@@ -1231,16 +1244,7 @@ public class ActiveCallActivity extends Activity {
         if (status == null) return;
         Log.d(TAG, "applyStatus: " + status + " reason=" + reason);
         latestStatus = status;
-        String text;
-        switch (status) {
-            case OUTGOING_RINGING: text = "Calling…"; break;
-            case INCOMING_RINGING: text = "Incoming call"; break;
-            case CONNECTING: text = "Connecting…"; break;
-            case ACTIVE: text = "Active"; break;
-            case ENDED: text = endReasonText(reason); break;
-            case IDLE:
-            default: text = null; break;
-        }
+        String text = computeStatusText(status, reason);
         if (text != null) {
             if (statusView != null) statusView.setText(text);
             if (statusViewVideo != null) statusViewVideo.setText(text);
@@ -1264,11 +1268,60 @@ public class ActiveCallActivity extends Activity {
     }
 
     private void updateDuration(int seconds) {
+        // When reconnecting, suppress the duration tick — the status
+        // text shows "Reconnecting…" and the visible MM:SS would be
+        // misleading (the call is paused from the user's perspective).
+        if ("reconnecting".equals(latestConnectionQuality)
+                && (latestStatus == NativeVoiceCallManager.CallStatus.ACTIVE
+                    || latestStatus == NativeVoiceCallManager.CallStatus.CONNECTING)) {
+            return;
+        }
         int m = seconds / 60;
         int s = seconds % 60;
         String txt = String.format("%d:%02d", m, s);
         if (durationView != null) durationView.setText(txt);
         if (durationViewVideo != null) durationViewVideo.setText(txt);
+    }
+
+    /**
+     * Compute the live status-text string. Mirrors the JS-side
+     * {@code statusText} derived store in {@code ActiveCallOverlay.svelte}:
+     * the connection-quality "reconnecting" signal overrides the
+     * live-media status text but does not affect ringing or ended
+     * copy.
+     */
+    private String computeStatusText(
+            NativeVoiceCallManager.CallStatus status, String reason) {
+        if ("reconnecting".equals(latestConnectionQuality)
+                && (status == NativeVoiceCallManager.CallStatus.CONNECTING
+                    || status == NativeVoiceCallManager.CallStatus.ACTIVE)) {
+            return getString(R.string.voice_call_reconnecting);
+        }
+        switch (status) {
+            case OUTGOING_RINGING: return "Calling\u2026";
+            case INCOMING_RINGING: return "Incoming call";
+            case CONNECTING:       return "Connecting\u2026";
+            case ACTIVE:           return "Active";
+            case ENDED:            return endReasonText(reason);
+            case IDLE:
+            default:               return null;
+        }
+    }
+
+    /**
+     * Apply a connection-quality transition. Re-renders the status
+     * text immediately so the "Reconnecting…" pill appears /
+     * disappears without waiting for the next status transition.
+     */
+    private void applyConnectionQuality(String quality) {
+        if (quality == null) quality = "good";
+        if (quality.equals(latestConnectionQuality)) return;
+        latestConnectionQuality = quality;
+        String text = computeStatusText(latestStatus, null);
+        if (text != null) {
+            if (statusView != null) statusView.setText(text);
+            if (statusViewVideo != null) statusViewVideo.setText(text);
+        }
     }
 
     private void applyMute(boolean newMuted) {

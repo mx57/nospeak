@@ -41,7 +41,8 @@ function buildParticipants(
             callId: e.callId ?? 'cid-' + e.pubkeyHex.slice(0, 4),
             role: e.role ?? 'offerer',
             pcStatus: e.pcStatus ?? 'pending',
-            endReason: e.endReason ?? null
+            endReason: e.endReason ?? null,
+            connectionQuality: e.connectionQuality ?? 'good'
         };
     }
     return map;

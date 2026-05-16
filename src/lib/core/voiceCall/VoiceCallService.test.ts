@@ -1306,4 +1306,381 @@ describe('VoiceCallService', () => {
             expect(senders.sendAnswer).not.toHaveBeenCalled();
         });
     });
+
+    // ------------------------------------------------------------------
+    //  ICE restart on FAILED / transient DISCONNECTED handling
+    //  (add-ice-restart-on-failed). 1-on-1 only.
+    //
+    //  Election uses the lex-pubkey rule already exercised in the
+    //  renegotiation glare tests. Mock peer connections expose
+    //  iceConnectionState; tests force transitions and assert:
+    //    - transient disconnected does not terminate the call
+    //    - grace timeout escalates to the restart election
+    //    - lex-pubkey local-wins → kind-25055 published; local-loses →
+    //      no kind-25055 published; both arm the watchdog
+    //    - post-restart connected resets state and emits the
+    //      restart-succeeded log
+    //    - post-restart failed terminates with `ice-failed`
+    //    - watchdog expiry terminates with `ice-failed`
+    //    - failed-during-media-renegotiation defers, then fires after
+    //      the media renegotiation completes
+    // ------------------------------------------------------------------
+    describe('ICE restart on FAILED', () => {
+        // Hex pubkeys for deterministic election outcomes.
+        const PEER_HEX_LOW = '0'.repeat(64);
+        const PEER_HEX_HIGH = 'f'.repeat(64);
+        // selfHex is fixed by bringUpActiveVoiceCall below; mid-range
+        // ('5'.repeat(64)) so we can craft peers strictly above or
+        // below to drive election direction.
+        const SELF_HEX = '5'.repeat(64);
+
+        /**
+         * Bring the service to ACTIVE with a primed peer connection
+         * whose remote peer hex we control. Returns the pc and helper
+         * data so tests can drive ICE-state transitions.
+         */
+        async function bringUpActiveVoiceCallAgainst(
+            senders: NipAcSenders,
+            peerHex: string
+        ): Promise<{ pc: any; peerHex: string; selfHex: string; callId: string }> {
+            service.registerNipAcSenders(senders);
+            await service.initiateCall(nip19.npubEncode(peerHex), 'voice');
+            const pc = (globalThis as any).__lastPeerConnection;
+            // Apply a synthetic answer so we transition to active and
+            // the local selfHex is primed via maybePrimeSelfHex (added
+            // to handleAnswer so the lex-pubkey election has a
+            // resolved local hex even outside of glare).
+            const answerInner: NostrEvent = {
+                kind: NIP_AC_KIND_ANSWER,
+                pubkey: peerHex,
+                created_at: Math.floor(Date.now() / 1000),
+                content: 'sdp-answer',
+                tags: [
+                    ['p', SELF_HEX],
+                    ['call-id', get(voiceCallState).callId!],
+                    ['alt', 'WebRTC call answer']
+                ],
+                id: 'inner-answer-ice',
+                sig: ''
+            };
+            await service.handleNipAcEvent(answerInner);
+            pc.iceConnectionState = 'connected';
+            pc.oniceconnectionstatechange();
+            return {
+                pc,
+                peerHex,
+                selfHex: SELF_HEX,
+                callId: get(voiceCallState).callId!
+            };
+        }
+
+        it('transient disconnected does not terminate; recovery clears reconnecting', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+                expect(get(voiceCallState).status).toBe('active');
+                expect(get(voiceCallState).connectionQuality).toBe('good');
+
+                pc.iceConnectionState = 'disconnected';
+                pc.oniceconnectionstatechange();
+
+                expect(get(voiceCallState).status).toBe('active');
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+
+                // Recovery before the grace window expires.
+                pc.iceConnectionState = 'connected';
+                pc.oniceconnectionstatechange();
+
+                expect(get(voiceCallState).connectionQuality).toBe('good');
+                expect(get(voiceCallState).status).toBe('active');
+                // No kind-25055 was published.
+                expect(senders.sendRenegotiate).not.toHaveBeenCalled();
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        /**
+         * Flush microtasks (Promise.then continuations) without
+         * advancing the fake-timer wall-clock. The publish-restart
+         * path is several awaits deep (createOffer → setLocalDescription
+         * → publish); we need its sender to invoke without also
+         * tripping the 30s watchdog or any other pending real timer.
+         */
+        async function flushMicrotasks(): Promise<void> {
+            // 4 cycles is plenty for the deepest current await chain.
+            for (let i = 0; i < 4; i++) await Promise.resolve();
+        }
+
+        it('grace timeout triggers restart election (local-wins) and publishes kind-25055', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                // PEER_HEX_HIGH > SELF_HEX → local wins.
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+
+                pc.iceConnectionState = 'disconnected';
+                pc.oniceconnectionstatechange();
+                expect(senders.sendRenegotiate).not.toHaveBeenCalled();
+                // Grace window is now armed; reconnecting flagged.
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+
+                // Advance past ICE_DISCONNECTED_GRACE_MS (15s) only.
+                // This fires the grace timer which calls triggerIceRestart.
+                await vi.advanceTimersByTimeAsync(15_001);
+                await flushMicrotasks();
+
+                expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+                expect(get(voiceCallState).renegotiationState).toBe('outgoing');
+                expect(get(voiceCallState).renegotiationTrigger).toBe('ice-restart');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('failed (local-wins election) publishes kind-25055 immediately', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+
+                expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+                expect(get(voiceCallState).status).toBe('active');
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+                expect(get(voiceCallState).renegotiationTrigger).toBe('ice-restart');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('failed (local-loses election) does not publish; waits for peer kind-25055', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                // PEER_HEX_LOW < SELF_HEX → local loses.
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_LOW
+                );
+
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+
+                expect(senders.sendRenegotiate).not.toHaveBeenCalled();
+                expect(get(voiceCallState).status).toBe('active');
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+                // No outgoing renegotiation in flight on this side.
+                expect(get(voiceCallState).renegotiationState).toBe('idle');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('restart-then-connected clears reconnecting and keeps the call active', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+
+                expect(get(voiceCallState).connectionQuality).toBe('reconnecting');
+
+                // Restart succeeded → connection back to connected.
+                pc.iceConnectionState = 'connected';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+
+                expect(get(voiceCallState).connectionQuality).toBe('good');
+                expect(get(voiceCallState).status).toBe('active');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('post-restart failed terminates the call with ice-failed', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+                expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+                expect(get(voiceCallState).status).toBe('active');
+
+                // Second failure (post-restart) → terminal.
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+
+                expect(get(voiceCallState).status).toBe('ended');
+                expect(get(voiceCallState).endReason).toBe('ice-failed');
+                // No second restart attempted.
+                expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('restart watchdog expiry terminates the call with ice-failed', async () => {
+            vi.useFakeTimers();
+            try {
+                const senders = noopSenders();
+                const { pc } = await bringUpActiveVoiceCallAgainst(
+                    senders,
+                    PEER_HEX_HIGH
+                );
+
+                pc.iceConnectionState = 'failed';
+                pc.oniceconnectionstatechange();
+                await flushMicrotasks();
+                expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+                expect(get(voiceCallState).status).toBe('active');
+
+                // No peer answer arrives. Leave the ICE state in a
+                // non-connected, non-failed state (the test mock has
+                // been set to 'failed' once; we override here so the
+                // post-restart 'failed' branch doesn't run again).
+                // The watchdog reads peerConnection?.iceConnectionState
+                // at fire time and terminates because the call hasn't
+                // recovered.
+                pc.iceConnectionState = 'checking';
+                await vi.advanceTimersByTimeAsync(30_001);
+                await flushMicrotasks();
+
+                expect(get(voiceCallState).status).toBe('ended');
+                expect(get(voiceCallState).endReason).toBe('ice-failed');
+            } finally {
+                vi.useRealTimers();
+            }
+        });
+
+        it('failed during in-flight voice→video upgrade defers restart until upgrade completes', async () => {
+            // The default install stream is audio-only and lacks
+            // addTrack/getVideoTracks; reinstall with a video-capable
+            // stream so requestVideoUpgrade's localStream.addTrack
+            // call works.
+            const audioTrack = { stop: vi.fn(), kind: 'audio', enabled: true };
+            const videoTrack = { stop: vi.fn(), kind: 'video', enabled: true };
+            const streamTracks: any[] = [audioTrack];
+            const fakeStream = {
+                getTracks: () => streamTracks.slice(),
+                getAudioTracks: () => [audioTrack],
+                getVideoTracks: () => streamTracks.filter((t) => t.kind === 'video'),
+                addTrack: vi.fn((t: any) => streamTracks.push(t)),
+                removeTrack: vi.fn((t: any) => {
+                    const i = streamTracks.indexOf(t);
+                    if (i >= 0) streamTracks.splice(i, 1);
+                })
+            };
+            const cameraStream = {
+                getTracks: () => [videoTrack],
+                getAudioTracks: () => [],
+                getVideoTracks: () => [videoTrack]
+            };
+            const getUserMedia = vi.fn().mockImplementation((constraints: any) => {
+                // First call (initiateCall) → audio-only stream;
+                // subsequent (camera upgrade) → video-only stream.
+                return constraints?.video ? Promise.resolve(cameraStream) : Promise.resolve(fakeStream);
+            });
+            (globalThis as any).navigator = {
+                ...((globalThis as any).navigator ?? {}),
+                mediaDevices: { getUserMedia }
+            };
+
+            const senders = noopSenders();
+            const { pc } = await bringUpActiveVoiceCallAgainst(
+                senders,
+                PEER_HEX_HIGH
+            );
+
+            // Patch the peer connection for renegotiation surface.
+            pc.getSenders = vi.fn(() => []);
+            const origAddTrack = pc.addTrack;
+            pc.addTrack = vi.fn(function (track: any, stream: any) {
+                if (typeof origAddTrack === 'function') {
+                    return origAddTrack.call(pc, track, stream);
+                }
+            });
+            pc.removeTrack = vi.fn();
+            pc.signalingState = 'stable';
+
+            // Kick off the upgrade — publishes kind-25055 and leaves
+            // renegotiationState === 'outgoing' until the answer arrives.
+            await service.requestVideoUpgrade();
+            expect(get(voiceCallState).renegotiationState).toBe('outgoing');
+            expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+
+            // ICE fails during the upgrade. Restart MUST be deferred.
+            pc.iceConnectionState = 'failed';
+            pc.oniceconnectionstatechange();
+            // Microtask settle (no fake timers; the renegotiation
+            // timeout is 30s real-time which we'll never reach here).
+            for (let i = 0; i < 4; i++) await Promise.resolve();
+            expect(senders.sendRenegotiate).toHaveBeenCalledTimes(1);
+
+            // Peer answers the upgrade. completeOutgoingRenegotiation
+            // → setRenegotiationState(IDLE) → maybeFireDeferredIceRestart
+            // → triggerIceRestart('failed') → second kind-25055.
+            const upgradeAnswer: NostrEvent = {
+                kind: NIP_AC_KIND_ANSWER,
+                pubkey: PEER_HEX_HIGH,
+                created_at: Math.floor(Date.now() / 1000),
+                content:
+                    'v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n',
+                tags: [
+                    ['p', SELF_HEX],
+                    ['call-id', get(voiceCallState).callId!],
+                    ['alt', 'WebRTC call answer']
+                ],
+                id: 'inner-25051-upgrade-ice',
+                sig: ''
+            };
+            await service.handleNipAcEvent(upgradeAnswer);
+            for (let i = 0; i < 4; i++) await Promise.resolve();
+
+            expect(senders.sendRenegotiate).toHaveBeenCalledTimes(2);
+        });
+
+        it('pre-setup failure (outgoing-ringing) terminates immediately without restart', async () => {
+            const senders = noopSenders();
+            service.registerNipAcSenders(senders);
+            await service.initiateCall(nip19.npubEncode(PEER_HEX_HIGH));
+            const pc = (globalThis as any).__lastPeerConnection;
+
+            // Force failure while still in outgoing-ringing.
+            pc.iceConnectionState = 'failed';
+            pc.oniceconnectionstatechange();
+
+            expect(get(voiceCallState).status).toBe('ended');
+            expect(get(voiceCallState).endReason).toBe('ice-failed');
+            expect(senders.sendRenegotiate).not.toHaveBeenCalled();
+        });
+    });
 });

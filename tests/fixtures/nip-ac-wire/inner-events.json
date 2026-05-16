@@ -104,6 +104,15 @@
             "expectedId": "48e33d9eb9f5323e91c5cbedfe35087cfbbb9e6ef404c5fd0e47cc3be55e6d2a"
         },
         {
+            "name": "renegotiate (ICE restart on failure)",
+            "_doc": "kind-25055 reused for ICE restart per add-ice-restart-on-failed. Wire shape (envelope + tags + altText) is byte-equivalent to a media-change renegotiate; only the SDP content differs (carries fresh a=ice-ufrag / a=ice-pwd and a=ice-options:trickle). Receivers cannot distinguish ICE restart from media change on the wire; the distinction is internal to the sender for diagnostics.",
+            "kind": 25055,
+            "content": "v=0\r\no=- 3 3 IN IP4 127.0.0.1\r\na=ice-options:trickle\r\na=ice-ufrag:rstrt\r\na=ice-pwd:abcdefghijklmnopqrstuvwx\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            "altText": "WebRTC call renegotiation",
+            "extraTags": [],
+            "expectedId": "8f2a50985a05b30bb485f6e2f8a2f4c183a33ddd37a287fb037eca18932c4762"
+        },
+        {
             "name": "group offer (real SDP)",
             "kind": 25050,
             "content": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n",

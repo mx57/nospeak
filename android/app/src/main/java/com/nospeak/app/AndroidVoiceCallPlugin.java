@@ -604,6 +604,27 @@ public class AndroidVoiceCallPlugin extends Plugin {
     }
 
     /**
+     * Emit a {@code connectionQualityChanged} event when the active
+     * call's connection-quality signal transitions between {@code "good"}
+     * and {@code "reconnecting"}. The JS layer mirrors the value into
+     * {@code voiceCallState.connectionQuality} so the active-call UI
+     * (and ActiveCallActivity) can render the "Reconnecting…" pill.
+     * Part of {@code add-ice-restart-on-failed}.
+     */
+    public static void emitConnectionQualityChanged(String callId, String quality) {
+        AndroidVoiceCallPlugin p = sInstance;
+        if (p == null) return;
+        JSObject data = new JSObject();
+        data.put("callId", callId != null ? callId : "");
+        data.put("quality", quality != null ? quality : "good");
+        try {
+            p.notifyListeners("connectionQualityChanged", data, true);
+        } catch (Exception e) {
+            Log.w(TAG, "emitConnectionQualityChanged failed", e);
+        }
+    }
+
+    /**
      * Emit a {@code callKindChanged} event when the active call's
      * media kind changes mid-call (e.g., voice→video upgrade via a
      * successful kind-25055 renegotiation). The JS layer mirrors the

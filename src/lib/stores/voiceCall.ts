@@ -4,6 +4,8 @@ import type {
     VoiceCallEndReason,
     CallKind,
     RenegotiationState,
+    RenegotiationTrigger,
+    ConnectionQuality,
     GroupVoiceCallState,
     ParticipantState,
     ParticipantPcStatus,
@@ -23,7 +25,9 @@ const INITIAL_STATE: VoiceCallState = {
     isCameraOff: false,
     isCameraFlipping: false,
     facingMode: 'user',
-    renegotiationState: 'idle'
+    renegotiationState: 'idle',
+    renegotiationTrigger: null,
+    connectionQuality: 'good'
 };
 
 export const voiceCallState = writable<VoiceCallState>({ ...INITIAL_STATE });
@@ -71,7 +75,11 @@ export function endCall(reason: VoiceCallEndReason): void {
         endReason: reason,
         // Per spec: any in-flight renegotiation is implicitly cancelled
         // when the underlying call ends.
-        renegotiationState: 'idle'
+        renegotiationState: 'idle',
+        renegotiationTrigger: null,
+        // Per spec: connectionQuality SHALL be restored to 'good' when
+        // the call transitions to ended.
+        connectionQuality: 'good'
     }));
 }
 
@@ -85,7 +93,9 @@ export function setEndedAnsweredElsewhere(): void {
         ...s,
         status: 'ended',
         endReason: 'answered-elsewhere',
-        renegotiationState: 'idle'
+        renegotiationState: 'idle',
+        renegotiationTrigger: null,
+        connectionQuality: 'good'
     }));
 }
 
@@ -98,7 +108,9 @@ export function setEndedRejectedElsewhere(): void {
         ...s,
         status: 'ended',
         endReason: 'rejected-elsewhere',
-        renegotiationState: 'idle'
+        renegotiationState: 'idle',
+        renegotiationTrigger: null,
+        connectionQuality: 'good'
     }));
 }
 
@@ -163,9 +175,47 @@ export function setSpeakerOn(on: boolean): void {
  * Set the in-flight NIP-AC kind-25055 renegotiation state. Drives
  * "Add video" button gating and is observable by tests. The store
  * does not enforce transitions — backends are the source of truth.
+ *
+ * When transitioning AWAY from a non-idle state to `'idle'`, callers
+ * SHOULD also reset {@code renegotiationTrigger} to {@code null}; pass
+ * {@code trigger: null} explicitly or use the
+ * {@link setRenegotiationTrigger} helper.
  */
-export function setRenegotiationState(state: RenegotiationState): void {
-    voiceCallState.update(s => ({ ...s, renegotiationState: state }));
+export function setRenegotiationState(
+    state: RenegotiationState,
+    trigger?: RenegotiationTrigger
+): void {
+    voiceCallState.update(s => ({
+        ...s,
+        renegotiationState: state,
+        // Always clear the trigger when returning to idle; preserve
+        // otherwise unless the caller passes a new value.
+        renegotiationTrigger:
+            state === 'idle'
+                ? null
+                : trigger !== undefined
+                    ? trigger
+                    : s.renegotiationTrigger
+    }));
+}
+
+/**
+ * Set the renegotiation trigger label without touching the state.
+ * Used by backends to label an outgoing renegotiation as either a
+ * media change or an ICE restart for diagnostics. Wire-invisible.
+ */
+export function setRenegotiationTrigger(trigger: RenegotiationTrigger): void {
+    voiceCallState.update(s => ({ ...s, renegotiationTrigger: trigger }));
+}
+
+/**
+ * Set the connection-quality signal. See {@link ConnectionQuality}.
+ * Set by the backend on entry/exit of the disconnected-grace window
+ * and around in-flight ICE restarts. Drives the "Reconnecting…" UI
+ * pill.
+ */
+export function setConnectionQuality(quality: ConnectionQuality): void {
+    voiceCallState.update(s => ({ ...s, connectionQuality: quality }));
 }
 
 /* ------------------------------------------------------------------ *
@@ -241,7 +291,8 @@ function buildParticipantSeed(
         callId,
         role,
         pcStatus,
-        endReason: null
+        endReason: null,
+        connectionQuality: 'good'
     };
 }
 
@@ -368,11 +419,39 @@ export function setGroupParticipantStatus(
         const updated: ParticipantState = {
             ...existing,
             pcStatus,
-            endReason: pcStatus === 'ended' ? endReason : existing.endReason
+            endReason: pcStatus === 'ended' ? endReason : existing.endReason,
+            // Per spec: connectionQuality SHALL be restored to 'good'
+            // when this participant's edge ends.
+            connectionQuality:
+                pcStatus === 'ended' ? 'good' : existing.connectionQuality
         };
         const nextParticipants = { ...s.participants, [pubkeyHex]: updated };
         const nextStatus = deriveGroupStatus(nextParticipants, s.status);
         return { ...s, participants: nextParticipants, status: nextStatus };
+    });
+}
+
+/**
+ * Set the per-participant connection-quality signal. See
+ * {@link ConnectionQuality}. Per-edge: setting one participant to
+ * `'reconnecting'` does not affect any other participant's flag.
+ */
+export function setGroupParticipantConnectionQuality(
+    pubkeyHex: string,
+    quality: ConnectionQuality
+): void {
+    groupVoiceCallState.update((s) => {
+        if (s.groupCallId === null) return s;
+        const existing = s.participants[pubkeyHex];
+        if (!existing) return s;
+        const updated: ParticipantState = {
+            ...existing,
+            connectionQuality: quality
+        };
+        return {
+            ...s,
+            participants: { ...s.participants, [pubkeyHex]: updated }
+        };
     });
 }
 

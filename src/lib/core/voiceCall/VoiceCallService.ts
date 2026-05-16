@@ -17,11 +17,14 @@ import {
     setFacingMode,
     setSpeakerOn,
     setRenegotiationState,
+    setRenegotiationTrigger,
+    setConnectionQuality,
     groupVoiceCallState,
     setGroupOutgoingRinging,
     setGroupIncomingRinging,
     upsertGroupParticipant,
     setGroupParticipantStatus,
+    setGroupParticipantConnectionQuality,
     setGroupConnecting,
     endGroupCall,
     setGroupEndedAnsweredElsewhere,
@@ -32,9 +35,12 @@ import {
 } from '$lib/stores/voiceCall';
 import { getIceServers } from '$lib/core/runtimeConfig/store';
 import { dumpIceFailedStats } from './iceFailedDiagnostic';
+import { logIceRestartEvent } from './iceRestartDiagnostic';
+import { shouldInitiateIceRestart } from './iceRestartElection';
 import {
     CALL_OFFER_TIMEOUT_MS,
     ICE_CONNECTION_TIMEOUT_MS,
+    ICE_DISCONNECTED_GRACE_MS,
     RENEGOTIATION_TIMEOUT_MS,
     AUDIO_CONSTRAINTS,
     VIDEO_MEDIA_CONSTRAINTS,
@@ -219,6 +225,48 @@ export class VoiceCallService implements VoiceCallBackend {
      * (timeout, glare loss, error) can remove it cleanly.
      */
     private renegotiationPendingVideoTrack: MediaStreamTrack | null = null;
+
+    // ------------------------------------------------------------------
+    //  ICE-restart-on-failure state (NIP-AC kind-25055 reused for
+    //  recovery). See {@code add-ice-restart-on-failed} OpenSpec change.
+    //
+    //  Lifecycle: at most one attempt per failure. `iceRestartAttempted`
+    //  is set when the restart fires (initiator) or when the inbound
+    //  kind-25055 is processed as a restart (loser). Cleared on the
+    //  next `connected`/`completed`. If `iceConnectionState` re-enters
+    //  `failed` while this flag is set, the call terminates with
+    //  `ice-failed` (no second attempt).
+    // ------------------------------------------------------------------
+
+    /** One-attempt-per-failure cap. */
+    private iceRestartAttempted = false;
+    /**
+     * Set when a restart trigger fires while {@code renegotiationState}
+     * is not `'idle'` (a media-change renegotiation is in flight).
+     * The deferred restart fires when the in-flight renegotiation
+     * completes, subject to the recovery check.
+     */
+    private pendingIceRestart = false;
+    /**
+     * Disconnected-grace timer: armed on entry to
+     * {@code iceConnectionState === 'disconnected'}, cancelled on
+     * recovery or escalation to `failed`. On expiry, treats the call
+     * as failed and proceeds to the ICE-restart election.
+     */
+    private disconnectedGraceTimerId: ReturnType<typeof setTimeout> | null = null;
+    /**
+     * Restart watchdog: armed when the restart kind-25055 is published
+     * (initiator) or when the loser side first observes failure.
+     * Cancelled on recovery or post-restart `failed`. On expiry,
+     * terminates the call with `ice-failed`.
+     */
+    private iceRestartWatchdogId: ReturnType<typeof setTimeout> | null = null;
+    /**
+     * Wall-clock at which the restart fired (or was received), used
+     * for the elapsed-ms diagnostic in `restart-succeeded` /
+     * `restart-failed` log lines.
+     */
+    private iceRestartFiredAt: number | null = null;
 
     // ------------------------------------------------------------------
     //  Group voice-call state (full-mesh, anchored to a group
@@ -823,6 +871,28 @@ export class VoiceCallService implements VoiceCallBackend {
             if (iceState === 'connected' || iceState === 'completed') {
                 this.iceTrickleEnabled = false;
                 this.clearTimeouts();
+                // Cancel any in-flight ICE-restart-machinery timers
+                // (grace window OR restart watchdog) and reset the
+                // one-attempt flag so a future failure on this same
+                // call gets its own restart attempt. Restore
+                // connectionQuality to 'good'.
+                this.cancelDisconnectedGraceTimer();
+                this.cancelIceRestartWatchdog();
+                const wasRestartInFlight = this.iceRestartAttempted;
+                const firedAt = this.iceRestartFiredAt;
+                this.iceRestartAttempted = false;
+                this.pendingIceRestart = false;
+                this.iceRestartFiredAt = null;
+                setConnectionQuality('good');
+                if (wasRestartInFlight) {
+                    logIceRestartEvent('restart-succeeded', {
+                        elapsedMs:
+                            firedAt !== null
+                                ? Math.max(0, Math.round(performance.now() - firedAt))
+                                : 0,
+                        peerHex: this.currentPeerHex
+                    });
+                }
                 setActive();
                 // Default to speakerphone on for video calls — users hold
                 // the device away from their face. Voice calls keep the
@@ -831,8 +901,70 @@ export class VoiceCallService implements VoiceCallBackend {
                     setSpeakerOn(true);
                 }
                 this.startDurationTimer();
-            } else if (iceState === 'failed' || iceState === 'disconnected') {
-                this.handleIceFailure();
+            } else if (iceState === 'failed') {
+                // FAILED handling:
+                //   - If a restart was already attempted → terminal
+                //     (one-attempt cap).
+                //   - If status is connecting/active → attempt restart.
+                //   - Otherwise (outgoing-ringing / incoming-ringing /
+                //     setup-time failures) → terminal directly. The
+                //     restart election is only defined for live media
+                //     sessions; pre-setup failures route through the
+                //     existing terminal handler.
+                this.cancelDisconnectedGraceTimer();
+                const callStatusOnFailed = get(voiceCallState).status;
+                if (this.iceRestartAttempted) {
+                    logIceRestartEvent('restart-failed', {
+                        elapsedMs:
+                            this.iceRestartFiredAt !== null
+                                ? Math.max(
+                                      0,
+                                      Math.round(
+                                          performance.now() - this.iceRestartFiredAt
+                                      )
+                                  )
+                                : 0,
+                        failure: 'failed-state',
+                        peerHex: this.currentPeerHex
+                    });
+                    this.handleIceFailure();
+                } else if (
+                    callStatusOnFailed === 'connecting' ||
+                    callStatusOnFailed === 'active'
+                ) {
+                    this.triggerIceRestart('failed');
+                } else {
+                    this.handleIceFailure();
+                }
+            } else if (iceState === 'disconnected') {
+                // Transient per the W3C spec: arm the grace timer and
+                // surface "Reconnecting…" without ending the call. If
+                // `iceRestartAttempted` is already true we treat
+                // disconnected as a pre-failure warning during the
+                // restart's own settling period and let the watchdog
+                // bound the wait. The grace-window machinery is also
+                // only meaningful for live media sessions — pre-setup
+                // (outgoing-ringing/incoming-ringing) disconnects are
+                // ignored here and bounded by the existing
+                // iceTimeoutId path.
+                const callStatusOnDisc = get(voiceCallState).status;
+                if (
+                    callStatusOnDisc !== 'connecting' &&
+                    callStatusOnDisc !== 'active'
+                ) {
+                    return;
+                }
+                if (this.iceRestartAttempted) {
+                    return;
+                }
+                if (this.disconnectedGraceTimerId) {
+                    return;
+                }
+                setConnectionQuality('reconnecting');
+                this.disconnectedGraceTimerId = setTimeout(() => {
+                    this.disconnectedGraceTimerId = null;
+                    this.triggerIceRestartFromGraceTimeout();
+                }, ICE_DISCONNECTED_GRACE_MS);
             }
         };
 
@@ -868,6 +1000,181 @@ export class VoiceCallService implements VoiceCallBackend {
         }
     }
 
+    // ------------------------------------------------------------------
+    //  ICE restart on failure (NIP-AC kind-25055 reused). One attempt
+    //  per failure; lex-pubkey election; coordinated with media
+    //  renegotiations via `pendingIceRestart`. See
+    //  openspec/changes/add-ice-restart-on-failed/.
+    // ------------------------------------------------------------------
+
+    /** Cancel the disconnected-grace timer if armed. Idempotent. */
+    private cancelDisconnectedGraceTimer(): void {
+        if (this.disconnectedGraceTimerId) {
+            clearTimeout(this.disconnectedGraceTimerId);
+            this.disconnectedGraceTimerId = null;
+        }
+    }
+
+    /** Cancel the ICE-restart watchdog if armed. Idempotent. */
+    private cancelIceRestartWatchdog(): void {
+        if (this.iceRestartWatchdogId) {
+            clearTimeout(this.iceRestartWatchdogId);
+            this.iceRestartWatchdogId = null;
+        }
+    }
+
+    /**
+     * Disconnected-grace timer fired without recovery. Treat as
+     * effectively failed and proceed to the ICE-restart election.
+     * No-op if the state has moved on (recovered or escalated to
+     * failed independently).
+     */
+    private triggerIceRestartFromGraceTimeout(): void {
+        const iceState = this.peerConnection?.iceConnectionState;
+        if (iceState === 'connected' || iceState === 'completed') {
+            // Recovered while the timeout was scheduled. No action.
+            return;
+        }
+        if (iceState === 'failed') {
+            // The `failed` handler will own the restart. No action.
+            return;
+        }
+        this.triggerIceRestart('disconnected-grace-timeout');
+    }
+
+    /**
+     * Arm the post-restart watchdog. On expiry, terminates the call
+     * with `ice-failed` if the connection has not recovered. Reuses
+     * `ICE_CONNECTION_TIMEOUT_MS` (30 s) — the same upper bound used
+     * for initial ICE establishment.
+     */
+    private armIceRestartWatchdog(): void {
+        this.cancelIceRestartWatchdog();
+        this.iceRestartWatchdogId = setTimeout(() => {
+            this.iceRestartWatchdogId = null;
+            if (!this.iceRestartAttempted) return;
+            const iceState = this.peerConnection?.iceConnectionState;
+            if (iceState === 'connected' || iceState === 'completed') return;
+            logIceRestartEvent('restart-failed', {
+                elapsedMs:
+                    this.iceRestartFiredAt !== null
+                        ? Math.max(
+                              0,
+                              Math.round(performance.now() - this.iceRestartFiredAt)
+                          )
+                        : 0,
+                failure: 'watchdog-expired',
+                peerHex: this.currentPeerHex
+            });
+            this.handleIceFailure();
+        }, ICE_CONNECTION_TIMEOUT_MS);
+    }
+
+    /**
+     * Initiate the ICE-restart election. If we win, publish a kind-
+     * 25055 with `iceRestart: true` and arm the watchdog. If we lose,
+     * just arm the watchdog and wait for the peer's inbound kind-
+     * 25055. If a media renegotiation is in flight, defer.
+     */
+    private triggerIceRestart(
+        trigger: 'failed' | 'disconnected-grace-timeout'
+    ): void {
+        // One-attempt cap. A repeat trigger after we already fired is
+        // a no-op; the watchdog or the next `failed` handles teardown.
+        if (this.iceRestartAttempted) return;
+
+        // Status guard: never restart a call that is not in a live
+        // media session. (handleIceFailure for `connecting` initial
+        // ICE failure handles its own terminal path.)
+        const callState = get(voiceCallState);
+        if (callState.status !== 'connecting' && callState.status !== 'active') {
+            return;
+        }
+        if (!this.peerConnection) return;
+
+        // Coordinate with any in-flight media renegotiation. Two kind-
+        // 25055 transactions cannot overlap on the same PeerConnection.
+        if (callState.renegotiationState !== 'idle') {
+            this.pendingIceRestart = true;
+            return;
+        }
+
+        // Resolve the lex-pubkey election.
+        const localHex = this.currentSelfHex;
+        const peerHex = this.currentPeerHex;
+        if (!localHex || !peerHex) {
+            // Without both hex pubkeys we cannot deterministically
+            // elect a side — fall back to the conservative terminal
+            // path to avoid both ends racing each other.
+            console.warn(
+                '[VoiceCall] triggerIceRestart: missing local/peer hex; cannot elect'
+            );
+            this.handleIceFailure();
+            return;
+        }
+
+        const localWins = shouldInitiateIceRestart(localHex, peerHex);
+        this.iceRestartAttempted = true;
+        this.iceRestartFiredAt = performance.now();
+        setConnectionQuality('reconnecting');
+
+        if (!localWins) {
+            // Loser: wait for the peer's inbound kind-25055. The
+            // watchdog bounds the wait.
+            logIceRestartEvent('restart-fired', {
+                election: 'local-loses',
+                trigger,
+                peerHex
+            });
+            this.armIceRestartWatchdog();
+            return;
+        }
+
+        // Winner: create the restart offer and publish it as kind-
+        // 25055. Mark the in-flight renegotiation as `'ice-restart'`
+        // so glare resolution and diagnostics can distinguish it from
+        // a media change.
+        setRenegotiationState('outgoing', 'ice-restart');
+        logIceRestartEvent('restart-fired', {
+            election: 'local-wins',
+            trigger,
+            peerHex
+        });
+        this.armIceRestartWatchdog();
+
+        void this.publishIceRestartOffer(callState.peerNpub, callState.callId);
+    }
+
+    /**
+     * Create the restart offer and publish it as kind-25055. Errors
+     * inside this path roll back the in-flight renegotiation state
+     * but leave `iceRestartAttempted` set — the watchdog handles
+     * terminal teardown.
+     */
+    private async publishIceRestartOffer(
+        peerNpub: string | null,
+        callId: string | null
+    ): Promise<void> {
+        if (!this.peerConnection || !peerNpub || !callId || !this.senders) {
+            setRenegotiationState('idle');
+            return;
+        }
+        try {
+            const offer = await this.peerConnection.createOffer({
+                iceRestart: true
+            } as RTCOfferOptions);
+            await this.peerConnection.setLocalDescription(offer);
+            if (offer.sdp) {
+                await this.tryCall(() =>
+                    this.senders!.sendRenegotiate(peerNpub, callId, offer.sdp!)
+                );
+            }
+        } catch (err) {
+            console.error('[VoiceCall] publishIceRestartOffer failed', err);
+            setRenegotiationState('idle');
+        }
+    }
+
     private async handleOffer(
         inner: NostrEvent,
         senderNpub: string,
@@ -875,6 +1182,10 @@ export class VoiceCallService implements VoiceCallBackend {
     ): Promise<void> {
         const state = get(voiceCallState);
         const groupState = get(groupVoiceCallState);
+
+        // Cache local hex for the ICE-restart election in case the
+        // call later fails before any kind-25055 has been seen.
+        this.maybePrimeSelfHex(inner);
 
         // Dedup: same callId from same peer while we're already ringing for it.
         // This happens when the offer arrives both via the live JS subscription
@@ -946,6 +1257,10 @@ export class VoiceCallService implements VoiceCallBackend {
         const state = get(voiceCallState);
         if (state.callId !== callId || !this.peerConnection) return;
 
+        // Cache local hex for the ICE-restart election in case the
+        // call later fails before any kind-25055 has been seen.
+        this.maybePrimeSelfHex(inner);
+
         const remoteDesc = new RTCSessionDescription({
             type: 'answer',
             sdp: inner.content
@@ -999,6 +1314,8 @@ export class VoiceCallService implements VoiceCallBackend {
      * the peer connection.
      */
     private async handleIceCandidate(inner: NostrEvent, callId: string): Promise<void> {
+        // Cache local hex for the ICE-restart election.
+        this.maybePrimeSelfHex(inner);
         let payload: { candidate: string; sdpMid: string | null; sdpMLineIndex: number | null };
         try {
             payload = JSON.parse(inner.content);
@@ -1174,7 +1491,32 @@ export class VoiceCallService implements VoiceCallBackend {
             this.discardOutgoingRenegotiationArtifacts();
         }
 
-        setRenegotiationState('incoming');
+        // Detect whether this inbound 25055 is the peer's ICE-restart
+        // attempt (vs. a media-change renegotiate). Treated as a
+        // restart if our local ICE state is `failed`/`disconnected`
+        // OR we have a grace timer armed at the moment the offer
+        // arrives. The wire shape is identical either way; the
+        // distinction is for diagnostics + watchdog accounting.
+        const localIceState = this.peerConnection.iceConnectionState;
+        const isLikelyIceRestart =
+            !this.iceRestartAttempted &&
+            (localIceState === 'failed' ||
+                localIceState === 'disconnected' ||
+                this.disconnectedGraceTimerId !== null);
+        if (isLikelyIceRestart) {
+            this.cancelDisconnectedGraceTimer();
+            this.iceRestartAttempted = true;
+            this.iceRestartFiredAt = performance.now();
+            setConnectionQuality('reconnecting');
+            this.armIceRestartWatchdog();
+            logIceRestartEvent('restart-received', {
+                election: 'local-loses',
+                peerHex: this.currentPeerHex
+            });
+            setRenegotiationState('incoming', 'ice-restart');
+        } else {
+            setRenegotiationState('incoming', 'media');
+        }
 
         try {
             const remoteDesc = new RTCSessionDescription({
@@ -1218,8 +1560,32 @@ export class VoiceCallService implements VoiceCallBackend {
         } catch (err) {
             console.error('[VoiceCall][Recv] handleRenegotiate failed', err);
         } finally {
+            // Reset to idle. If a restart was deferred (pendingIceRestart)
+            // during a media renegotiation, evaluate it now that the
+            // serializer slot is free.
             setRenegotiationState('idle');
+            this.maybeFireDeferredIceRestart();
         }
+    }
+
+    /**
+     * Re-evaluate {@code pendingIceRestart} after a renegotiation
+     * completes. If the connection has independently recovered, clear
+     * the flag and do nothing. Otherwise fire the deferred restart.
+     */
+    private maybeFireDeferredIceRestart(): void {
+        if (!this.pendingIceRestart) return;
+        this.pendingIceRestart = false;
+        const iceState = this.peerConnection?.iceConnectionState;
+        if (iceState === 'connected' || iceState === 'completed') {
+            // Recovered while the renegotiation was settling. No need
+            // to restart.
+            return;
+        }
+        // Use the trigger label that originally caused the defer; we
+        // do not track it across the defer window so use the generic
+        // `failed` label.
+        this.triggerIceRestart('failed');
     }
 
     /**
@@ -1280,7 +1646,7 @@ export class VoiceCallService implements VoiceCallBackend {
             return;
         }
 
-        setRenegotiationState('outgoing');
+        setRenegotiationState('outgoing', 'media');
 
         // Acquire camera.
         let videoTrack: MediaStreamTrack;
@@ -1294,6 +1660,7 @@ export class VoiceCallService implements VoiceCallBackend {
         } catch (err) {
             console.warn('[VoiceCall] camera permission denied for upgrade', err);
             setRenegotiationState('idle');
+            this.maybeFireDeferredIceRestart();
             return;
         }
 
@@ -1355,6 +1722,7 @@ export class VoiceCallService implements VoiceCallBackend {
             this.discardOutgoingRenegotiationArtifacts();
         }
         setRenegotiationState('idle');
+        this.maybeFireDeferredIceRestart();
     }
 
     /**
@@ -1386,6 +1754,7 @@ export class VoiceCallService implements VoiceCallBackend {
         this.discardOutgoingRenegotiationArtifacts();
         console.log('[VoiceCall] outgoing renegotiation rolled back; reason=' + reason);
         setRenegotiationState('idle');
+        this.maybeFireDeferredIceRestart();
     }
 
     /**
@@ -1443,6 +1812,19 @@ export class VoiceCallService implements VoiceCallBackend {
         const hex = pTag[1].toLowerCase();
         this.currentSelfHex = hex;
         return hex;
+    }
+
+    /**
+     * Opportunistically prime {@link currentSelfHex} from any inbound
+     * NIP-AC inner event that carries a `['p', selfHex]` tag. Used by
+     * the answer/offer/ICE-candidate paths so the lex-pubkey
+     * election in {@link triggerIceRestart} has a valid local hex
+     * even when no kind-25055 glare has occurred. Safe no-op when
+     * already cached.
+     */
+    private maybePrimeSelfHex(inner: NostrEvent): void {
+        if (this.currentSelfHex !== null) return;
+        this.resolveSelfHexFromInnerEvent(inner);
     }
 
     private async tryCall(fn: () => Promise<void>): Promise<void> {
@@ -2946,6 +3328,23 @@ export class VoiceCallService implements VoiceCallBackend {
             this.renegotiationTimeoutId = null;
         }
         this.renegotiationPendingVideoTrack = null;
+
+        // ICE-restart cleanup. All restart state is local to the
+        // backend (no store mirror beyond `connectionQuality`, which
+        // endCall / resetCall already reset). Cancel pending timers
+        // and clear the one-attempt flag so a subsequent call starts
+        // fresh.
+        this.iceRestartAttempted = false;
+        this.pendingIceRestart = false;
+        if (this.disconnectedGraceTimerId) {
+            clearTimeout(this.disconnectedGraceTimerId);
+            this.disconnectedGraceTimerId = null;
+        }
+        if (this.iceRestartWatchdogId) {
+            clearTimeout(this.iceRestartWatchdogId);
+            this.iceRestartWatchdogId = null;
+        }
+        this.iceRestartFiredAt = null;
 
         if (this.durationIntervalId) {
             clearInterval(this.durationIntervalId);

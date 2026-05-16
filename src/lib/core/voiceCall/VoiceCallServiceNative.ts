@@ -41,7 +41,8 @@ import {
     setCallKind,
     setCameraOff,
     setFacingMode,
-    setRenegotiationState
+    setRenegotiationState,
+    setConnectionQuality
 } from '$lib/stores/voiceCall';
 import { CALL_END_DISPLAY_MS } from './constants';
 
@@ -242,6 +243,15 @@ export class VoiceCallServiceNative implements VoiceCallBackend {
                         this.onCallKindChanged(data)
                 )
             );
+            this.listeners.push(
+                await AndroidVoiceCall.addListener(
+                    'connectionQualityChanged',
+                    (data: {
+                        callId: string;
+                        quality: 'good' | 'reconnecting';
+                    }) => this.onConnectionQualityChanged(data)
+                )
+            );
         } catch (err) {
             console.error('[VoiceCallNative] event subscription failed', err);
         }
@@ -254,6 +264,21 @@ export class VoiceCallServiceNative implements VoiceCallBackend {
         const next: CallKind = data.kind === 'video' ? 'video' : 'voice';
         this.callKind = next;
         setCallKind(next);
+    }
+
+    /**
+     * Mirror the native connection-quality signal into the JS store.
+     * Fired by {@code AndroidVoiceCallPlugin.emitConnectionQualityChanged}
+     * which itself routes through {@code NativeVoiceCallManager.setConnectionQuality}.
+     * Defensive: coerce any unknown value to {@code 'good'} so the
+     * store never carries a stray literal if the wire format drifts.
+     */
+    private onConnectionQualityChanged(data: {
+        callId: string;
+        quality: 'good' | 'reconnecting';
+    }): void {
+        const next = data.quality === 'reconnecting' ? 'reconnecting' : 'good';
+        setConnectionQuality(next);
     }
 
     private onCameraStateChanged(data: { callId: string; cameraOff: boolean }): void {

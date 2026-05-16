@@ -1,5 +1,19 @@
 export const CALL_OFFER_TIMEOUT_MS = 60_000;
 export const ICE_CONNECTION_TIMEOUT_MS = 30_000;
+/**
+ * Grace window for transient `iceConnectionState === 'disconnected'`
+ * before treating it as a failure. The W3C spec defines `disconnected`
+ * as transient (Wi-Fi handoff, brief packet loss); libwebrtc usually
+ * self-recovers to `connected` within a few seconds. If the state has
+ * not returned to `connected`/`completed` AND has not escalated to
+ * `failed` within this window, the system proactively triggers an
+ * ICE-restart (kind-25055 Call Renegotiate with iceRestart=true).
+ *
+ * Reused on Android as `ICE_DISCONNECTED_GRACE_MS` in
+ * {@code NativeVoiceCallManager}. The restart watchdog itself reuses
+ * the existing {@link ICE_CONNECTION_TIMEOUT_MS}.
+ */
+export const ICE_DISCONNECTED_GRACE_MS = 15_000;
 export const CALL_END_DISPLAY_MS = 2_000;
 /**
  * NIP-17 sealed-rumor kind for persistent call-history events

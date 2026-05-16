@@ -76,6 +76,14 @@ public class NativeVoiceCallManager {
     private static final long CALL_OFFER_TIMEOUT_MS = 60_000L;
     private static final long ICE_CONNECTION_TIMEOUT_MS = 30_000L;
     /**
+     * Grace window for transient {@code iceConnectionState ==
+     * DISCONNECTED} before treating it as a failure. Mirrors the
+     * JS-side {@code ICE_DISCONNECTED_GRACE_MS} in
+     * {@code constants.ts}. See
+     * openspec/changes/add-ice-restart-on-failed/.
+     */
+    private static final long ICE_DISCONNECTED_GRACE_MS = 15_000L;
+    /**
      * Outgoing-renegotiation timeout. If the matching kind-25051 answer
      * does not arrive within this window we roll back the local offer,
      * remove just-attached upgrade artifacts, and surface a non-fatal
@@ -167,6 +175,16 @@ public class NativeVoiceCallManager {
          * older listener doubles.
          */
         default void onRenegotiationStateChanged(RenegotiationState state) {}
+
+        /**
+         * Called when the connection-quality signal flips between
+         * {@code "good"} and {@code "reconnecting"}. UI uses this to
+         * surface the "Reconnecting…" pill while ICE is transient-
+         * disconnected (within the grace window) OR while an ICE
+         * restart is in flight. Default no-op for older listener
+         * doubles. See {@code add-ice-restart-on-failed}.
+         */
+        default void onConnectionQualityChanged(String quality) {}
     }
 
     /** Media kind of a call. Mirrors the JS-side {@code CallKind} union. */
@@ -205,6 +223,26 @@ public class NativeVoiceCallManager {
                 default:       return "idle";
             }
         }
+    }
+
+    /**
+     * Internal trigger label for an in-flight kind-25055 Call
+     * Renegotiate. Mirrors the JS-side {@code RenegotiationTrigger}
+     * union. Diagnostics-only; never on the wire.
+     *
+     * <ul>
+     *   <li>{@link #NONE} — no renegotiation in flight (paired with
+     *       {@link RenegotiationState#IDLE}).</li>
+     *   <li>{@link #MEDIA} — voice→video upgrade or any other
+     *       media-kind change.</li>
+     *   <li>{@link #ICE_RESTART} — ICE-restart attempt fired after
+     *       FAILED or after the disconnected-grace timer expires.</li>
+     * </ul>
+     */
+    public enum RenegotiationTrigger {
+        NONE,
+        MEDIA,
+        ICE_RESTART
     }
 
     /**
@@ -377,6 +415,54 @@ public class NativeVoiceCallManager {
      * fails (timeout, glare loss, error, peer decline).
      */
     private VideoTrack renegotiationPendingVideoTrack;
+
+    // ---------------------------------------------------------------
+    //  ICE-restart-on-failure state (NIP-AC kind-25055 reused for
+    //  recovery). 1-on-1 only. See
+    //  openspec/changes/add-ice-restart-on-failed/.
+    // ---------------------------------------------------------------
+
+    /** One-attempt-per-failure cap. */
+    private boolean iceRestartAttempted = false;
+    /**
+     * Set when a restart trigger fires while {@code renegotiationState}
+     * is not IDLE (a media renegotiation is in flight). The deferred
+     * restart fires when the in-flight renegotiation completes,
+     * subject to a recovery check.
+     */
+    private boolean pendingIceRestart = false;
+    /**
+     * Disconnected-grace timer: armed on entry to
+     * {@code IceConnectionState == DISCONNECTED}, cancelled on
+     * recovery or escalation to FAILED. On expiry, proceeds to the
+     * ICE-restart election.
+     */
+    private Runnable disconnectedGraceRunnable;
+    /**
+     * Restart watchdog: armed when the restart kind-25055 is published
+     * (initiator) or when the loser side first observes failure.
+     * Cancelled on recovery or post-restart FAILED. On expiry,
+     * terminates the call with {@code "ice-failed"}.
+     */
+    private Runnable iceRestartWatchdogRunnable;
+    /**
+     * Wall-clock (millis) at which the restart fired (or was received),
+     * used for the elapsed-ms diagnostic in {@code restart-succeeded}
+     * and {@code restart-failed} log lines. 0 when no restart in flight.
+     */
+    private long iceRestartFiredAtMs = 0L;
+    /**
+     * Internal trigger label for the in-flight kind-25055. Mirrors the
+     * JS-side {@code renegotiationTrigger} field. Diagnostics-only;
+     * never on the wire.
+     */
+    private RenegotiationTrigger renegotiationTrigger = RenegotiationTrigger.NONE;
+    /**
+     * Current connection-quality signal. Drives the
+     * {@code connectionQualityChanged} plugin event which mirrors into
+     * {@code voiceCallState.connectionQuality}.
+     */
+    private String connectionQuality = "good";
 
     /**
      * Optional UI listener. Set by ActiveCallActivity in onStart and
@@ -832,7 +918,35 @@ public class NativeVoiceCallManager {
             discardOutgoingRenegotiationArtifacts();
         }
 
-        setRenegotiationState(RenegotiationState.INCOMING);
+        // Detect whether this inbound 25055 is the peer's ICE-restart
+        // attempt (vs. a media-change renegotiate). Treated as a
+        // restart if local ICE state is FAILED/DISCONNECTED OR a
+        // grace timer is armed at the moment the offer arrives. The
+        // wire shape is identical either way; the distinction is for
+        // diagnostics + watchdog accounting.
+        PeerConnection.IceConnectionState localIceState = null;
+        try {
+            localIceState = peerConnection.iceConnectionState();
+        } catch (Throwable ignored) {}
+        boolean isLikelyIceRestart =
+            !iceRestartAttempted
+            && (localIceState == PeerConnection.IceConnectionState.FAILED
+                || localIceState == PeerConnection.IceConnectionState.DISCONNECTED
+                || disconnectedGraceRunnable != null);
+        if (isLikelyIceRestart) {
+            cancelDisconnectedGraceTimer();
+            iceRestartAttempted = true;
+            iceRestartFiredAtMs = System.currentTimeMillis();
+            setConnectionQuality("reconnecting");
+            armIceRestartWatchdog();
+            IceRestartLogger.logReceived(
+                IceRestartLogger.ELECTION_LOCAL_LOSES, peerHex);
+            setRenegotiationState(RenegotiationState.INCOMING);
+            setRenegotiationTrigger(RenegotiationTrigger.ICE_RESTART);
+        } else {
+            setRenegotiationState(RenegotiationState.INCOMING);
+            setRenegotiationTrigger(RenegotiationTrigger.MEDIA);
+        }
 
         SessionDescription remote = new SessionDescription(
             SessionDescription.Type.OFFER, offerSdp);
@@ -991,6 +1105,16 @@ public class NativeVoiceCallManager {
         return renegotiationState;
     }
 
+    /**
+     * Current connection-quality signal: {@code "good"} or
+     * {@code "reconnecting"}. Read by ActiveCallActivity on late bind
+     * (rotation, return-from-background) so the "Reconnecting…" pill
+     * is restored without waiting for the next state transition.
+     */
+    public String getConnectionQuality() {
+        return connectionQuality;
+    }
+
     /** User-initiated hangup from the active-call UI. */
     public void hangup() {
         ensureMain();
@@ -1122,6 +1246,10 @@ public class NativeVoiceCallManager {
             // shows the in-flight chrome immediately rather than
             // waiting for the next state transition.
             listener.onRenegotiationStateChanged(renegotiationState);
+            // Replay connection-quality so a late bind during an
+            // active ICE restart immediately surfaces "Reconnecting…"
+            // rather than the duration timer.
+            listener.onConnectionQualityChanged(connectionQuality);
         } catch (Throwable t) {
             Log.w(TAG, "initial listener push failed", t);
         }
@@ -1245,8 +1373,15 @@ public class NativeVoiceCallManager {
         cancelDurationTimer();
         cancelIdleReset();
         clearRenegotiationTimeout();
+        cancelDisconnectedGraceTimer();
+        cancelIceRestartWatchdog();
         renegotiationPendingVideoTrack = null;
         renegotiationState = RenegotiationState.IDLE;
+        renegotiationTrigger = RenegotiationTrigger.NONE;
+        iceRestartAttempted = false;
+        pendingIceRestart = false;
+        iceRestartFiredAtMs = 0L;
+        connectionQuality = "good";
         // Stop and dispose the camera capturer first so frames stop
         // flowing into the (about-to-be-disposed) video source.
         try {
@@ -1888,13 +2023,288 @@ public class NativeVoiceCallManager {
     /**
      * Set {@link #renegotiationState} and notify listeners + the JS
      * layer. Idempotent transitions (same → same) are a no-op.
+     *
+     * <p>On transition to IDLE, also evaluates the deferred ICE-restart
+     * flag ({@link #pendingIceRestart}) and fires the restart if the
+     * connection still needs recovery — this is the serialization
+     * point per the {@code Coordination with In-Flight Renegotiation}
+     * spec requirement. Deferring to {@code maybeFireDeferredIceRestart}
+     * also makes the deferred-restart codepath single-source-of-truth.
      */
     private void setRenegotiationState(RenegotiationState next) {
         if (renegotiationState == next) return;
         renegotiationState = next;
+        // Always clear the trigger label when returning to IDLE.
+        if (next == RenegotiationState.IDLE) {
+            renegotiationTrigger = RenegotiationTrigger.NONE;
+        }
         AndroidVoiceCallPlugin.emitRenegotiationStateChanged(callId, next.wireName());
         notifyRenegotiationStateChanged(uiListener, next, "uiListener");
         notifyRenegotiationStateChanged(serviceListener, next, "serviceListener");
+        if (next == RenegotiationState.IDLE) {
+            maybeFireDeferredIceRestart();
+        }
+    }
+
+    /**
+     * Set the in-flight renegotiation's trigger label. Used by the
+     * ICE-restart entry points to mark the kind-25055 as
+     * {@code ICE_RESTART} vs the upgrade path's {@code MEDIA}. Wire
+     * shape is identical either way; this is for diagnostics only.
+     */
+    private void setRenegotiationTrigger(RenegotiationTrigger trigger) {
+        renegotiationTrigger = trigger;
+    }
+
+    /**
+     * Set the connection-quality signal and notify both the JS layer
+     * (via {@code AndroidVoiceCallPlugin.emitConnectionQualityChanged})
+     * and any attached {@link UiListener}s. Idempotent — setting the
+     * same value is a no-op so duplicate transitions don't fire
+     * spurious events.
+     */
+    private void setConnectionQuality(String quality) {
+        if (quality == null) quality = "good";
+        if (quality.equals(connectionQuality)) return;
+        connectionQuality = quality;
+        AndroidVoiceCallPlugin.emitConnectionQualityChanged(callId, quality);
+        if (uiListener != null) {
+            try { uiListener.onConnectionQualityChanged(quality); } catch (Throwable t) {
+                Log.w(TAG, "uiListener.onConnectionQualityChanged failed", t);
+            }
+        }
+        if (serviceListener != null) {
+            try { serviceListener.onConnectionQualityChanged(quality); } catch (Throwable t) {
+                Log.w(TAG, "serviceListener.onConnectionQualityChanged failed", t);
+            }
+        }
+    }
+
+    /** Cancel the disconnected-grace timer if armed. Idempotent. */
+    private void cancelDisconnectedGraceTimer() {
+        if (disconnectedGraceRunnable != null) {
+            mainHandler.removeCallbacks(disconnectedGraceRunnable);
+            disconnectedGraceRunnable = null;
+        }
+    }
+
+    /** Cancel the ICE-restart watchdog if armed. Idempotent. */
+    private void cancelIceRestartWatchdog() {
+        if (iceRestartWatchdogRunnable != null) {
+            mainHandler.removeCallbacks(iceRestartWatchdogRunnable);
+            iceRestartWatchdogRunnable = null;
+        }
+    }
+
+    /**
+     * Disconnected-grace timer fired without recovery. Treat as
+     * effectively failed and proceed to the ICE-restart election.
+     * No-op if the state has moved on (recovered or escalated to
+     * FAILED independently).
+     */
+    private void triggerIceRestartFromGraceTimeout() {
+        if (peerConnection == null) return;
+        PeerConnection.IceConnectionState iceState;
+        try {
+            iceState = peerConnection.iceConnectionState();
+        } catch (Throwable t) {
+            return;
+        }
+        if (iceState == PeerConnection.IceConnectionState.CONNECTED
+                || iceState == PeerConnection.IceConnectionState.COMPLETED) {
+            return;
+        }
+        if (iceState == PeerConnection.IceConnectionState.FAILED) {
+            // The FAILED handler will own the restart. No action.
+            return;
+        }
+        triggerIceRestart(IceRestartLogger.TRIGGER_GRACE_TIMEOUT);
+    }
+
+    /**
+     * Arm the post-restart watchdog. On expiry, terminates the call
+     * with {@code "ice-failed"} if the connection has not recovered.
+     * Reuses {@link #ICE_CONNECTION_TIMEOUT_MS}.
+     */
+    private void armIceRestartWatchdog() {
+        cancelIceRestartWatchdog();
+        iceRestartWatchdogRunnable = () -> {
+            iceRestartWatchdogRunnable = null;
+            if (!iceRestartAttempted) return;
+            if (peerConnection != null) {
+                try {
+                    PeerConnection.IceConnectionState s =
+                        peerConnection.iceConnectionState();
+                    if (s == PeerConnection.IceConnectionState.CONNECTED
+                            || s == PeerConnection.IceConnectionState.COMPLETED) {
+                        return;
+                    }
+                } catch (Throwable t) {
+                    /* fall through to terminal */
+                }
+            }
+            IceRestartLogger.logFailed(
+                System.currentTimeMillis() - iceRestartFiredAtMs,
+                IceRestartLogger.FAILURE_WATCHDOG_EXPIRED,
+                peerHex);
+            finishCall("ice-failed", /* sendHangup= */ false);
+        };
+        mainHandler.postDelayed(iceRestartWatchdogRunnable, ICE_CONNECTION_TIMEOUT_MS);
+    }
+
+    /**
+     * Initiate the ICE-restart election. If the local side wins,
+     * publish a kind-25055 with {@code iceRestart: true} and arm the
+     * watchdog. If we lose, just arm the watchdog and wait for the
+     * peer's inbound kind-25055. If a media renegotiation is in
+     * flight, defer.
+     *
+     * <p>1-on-1 only. Group-call ICE restart is out of scope per the
+     * {@code add-ice-restart-on-failed} change.
+     */
+    private void triggerIceRestart(String trigger) {
+        // Status guard: live media sessions only. Pre-setup
+        // (OUTGOING_RINGING/INCOMING_RINGING) failures route through
+        // the existing terminal path.
+        if (status != CallStatus.CONNECTING && status != CallStatus.ACTIVE) return;
+        if (peerConnection == null) return;
+
+        // Resolve the lex-pubkey election once, then delegate the
+        // 3-input decision to the unit-tested helper.
+        String localHex = resolveSelfHexLowercase();
+        if (localHex == null || peerHex == null) {
+            Log.w(TAG, "triggerIceRestart: missing local/peer hex; cannot elect");
+            finishCall("ice-failed", /* sendHangup= */ false);
+            return;
+        }
+        boolean localWins = IceRestartElection.shouldInitiate(localHex, peerHex);
+        IceRestartDecision.Action action = IceRestartDecision.decide(
+            iceRestartAttempted,
+            renegotiationState != RenegotiationState.IDLE,
+            localWins);
+
+        switch (action) {
+            case NOOP:
+                return;
+            case DEFER:
+                pendingIceRestart = true;
+                return;
+            case WAIT_AS_LOSER:
+                iceRestartAttempted = true;
+                iceRestartFiredAtMs = System.currentTimeMillis();
+                setConnectionQuality("reconnecting");
+                IceRestartLogger.logFired(
+                    IceRestartLogger.ELECTION_LOCAL_LOSES, trigger, peerHex);
+                armIceRestartWatchdog();
+                return;
+            case FIRE:
+            default:
+                iceRestartAttempted = true;
+                iceRestartFiredAtMs = System.currentTimeMillis();
+                setConnectionQuality("reconnecting");
+                setRenegotiationState(RenegotiationState.OUTGOING);
+                setRenegotiationTrigger(RenegotiationTrigger.ICE_RESTART);
+                IceRestartLogger.logFired(
+                    IceRestartLogger.ELECTION_LOCAL_WINS, trigger, peerHex);
+                armIceRestartWatchdog();
+                publishIceRestartOffer();
+                return;
+        }
+    }
+
+    /** Build the iceRestart=true SDP constraints. */
+    private static MediaConstraints iceRestartConstraints(CallKind kind) {
+        MediaConstraints c = new MediaConstraints();
+        c.mandatory.add(new MediaConstraints.KeyValuePair(
+            "IceRestart", "true"));
+        c.mandatory.add(new MediaConstraints.KeyValuePair(
+            "OfferToReceiveAudio", "true"));
+        c.mandatory.add(new MediaConstraints.KeyValuePair(
+            "OfferToReceiveVideo", kind == CallKind.VIDEO ? "true" : "false"));
+        return c;
+    }
+
+    /**
+     * Create the restart offer and publish it as kind-25055. Errors
+     * roll back the in-flight renegotiation state but leave
+     * {@link #iceRestartAttempted} set — the watchdog handles
+     * terminal teardown.
+     */
+    private void publishIceRestartOffer() {
+        if (peerConnection == null || peerHex == null || callId == null) {
+            setRenegotiationState(RenegotiationState.IDLE);
+            return;
+        }
+        try {
+            peerConnection.createOffer(new SimpleSdpObserver("createOffer(ice-restart)") {
+                @Override
+                public void onCreateSuccess(final SessionDescription desc) {
+                    runOnMain(() -> {
+                        if (peerConnection == null) {
+                            setRenegotiationState(RenegotiationState.IDLE);
+                            return;
+                        }
+                        peerConnection.setLocalDescription(
+                            new SimpleSdpObserver("setLocal(ice-restart-offer)") {
+                                @Override public void onSetSuccess() {
+                                    runOnMain(() -> {
+                                        if (peerHex == null || callId == null) return;
+                                        try {
+                                            bridge.sendRenegotiate(
+                                                peerHex, callId, desc.description);
+                                        } catch (Throwable t) {
+                                            Log.w(TAG,
+                                                "bridge.sendRenegotiate(ice-restart) failed", t);
+                                        }
+                                    });
+                                }
+                                @Override public void onSetFailure(String error) {
+                                    runOnMain(() -> {
+                                        Log.e(TAG, "setLocal(ice-restart-offer) failed: " + error);
+                                        setRenegotiationState(RenegotiationState.IDLE);
+                                    });
+                                }
+                            },
+                            desc
+                        );
+                    });
+                }
+                @Override
+                public void onCreateFailure(String error) {
+                    runOnMain(() -> {
+                        Log.e(TAG, "createOffer(ice-restart) failed: " + error);
+                        setRenegotiationState(RenegotiationState.IDLE);
+                    });
+                }
+            }, iceRestartConstraints(callKind));
+        } catch (Throwable t) {
+            Log.e(TAG, "publishIceRestartOffer failed", t);
+            setRenegotiationState(RenegotiationState.IDLE);
+        }
+    }
+
+    /**
+     * Re-evaluate {@link #pendingIceRestart} after a renegotiation
+     * completes. If the connection has independently recovered, clear
+     * the flag and do nothing. Otherwise fire the deferred restart.
+     */
+    private void maybeFireDeferredIceRestart() {
+        if (!pendingIceRestart) return;
+        pendingIceRestart = false;
+        if (peerConnection == null) return;
+        PeerConnection.IceConnectionState iceState;
+        try {
+            iceState = peerConnection.iceConnectionState();
+        } catch (Throwable t) {
+            return;
+        }
+        if (iceState == PeerConnection.IceConnectionState.CONNECTED
+                || iceState == PeerConnection.IceConnectionState.COMPLETED) {
+            // Recovered while the renegotiation was settling. No
+            // restart needed.
+            return;
+        }
+        triggerIceRestart(IceRestartLogger.TRIGGER_FAILED);
     }
 
     /**
@@ -2136,6 +2546,18 @@ public class NativeVoiceCallManager {
             isCameraOff = false;
             isFrontCamera = true;
             isCameraFlipping = false;
+            // ICE-restart state was already reset by finishCall via
+            // cancelDisconnectedGraceTimer/cancelIceRestartWatchdog
+            // (see refactored PCObserver.onIceConnectionChange); reset
+            // again here for back-to-back safety in case finishCall
+            // bypassed the observer (e.g., user hangup).
+            cancelDisconnectedGraceTimer();
+            cancelIceRestartWatchdog();
+            iceRestartAttempted = false;
+            pendingIceRestart = false;
+            iceRestartFiredAtMs = 0L;
+            renegotiationTrigger = RenegotiationTrigger.NONE;
+            connectionQuality = "good";
         };
         mainHandler.postDelayed(idleResetRunnable, IDLE_RESET_DELAY_MS);
     }
@@ -2168,8 +2590,15 @@ public class NativeVoiceCallManager {
         sessionRemoteDescriptionSet = false;
         sessionPendingIce.clear();
         clearRenegotiationTimeout();
+        cancelDisconnectedGraceTimer();
+        cancelIceRestartWatchdog();
         renegotiationPendingVideoTrack = null;
         renegotiationState = RenegotiationState.IDLE;
+        renegotiationTrigger = RenegotiationTrigger.NONE;
+        iceRestartAttempted = false;
+        pendingIceRestart = false;
+        iceRestartFiredAtMs = 0L;
+        connectionQuality = "good";
     }
 
     private void authorHistoryEvent(CallStatus prevStatus, String reason) {
@@ -2296,6 +2725,23 @@ public class NativeVoiceCallManager {
                     || newState == PeerConnection.IceConnectionState.COMPLETED) {
                     iceTrickleEnabled = false;
                     cancelIceTimeout();
+                    // Cancel any in-flight ICE-restart-machinery
+                    // timers (grace window OR restart watchdog) and
+                    // reset the one-attempt flag so a future failure
+                    // on this same call gets its own restart attempt.
+                    // Restore connectionQuality to "good".
+                    cancelDisconnectedGraceTimer();
+                    cancelIceRestartWatchdog();
+                    boolean wasRestartInFlight = iceRestartAttempted;
+                    long firedAt = iceRestartFiredAtMs;
+                    iceRestartAttempted = false;
+                    pendingIceRestart = false;
+                    iceRestartFiredAtMs = 0L;
+                    setConnectionQuality("good");
+                    if (wasRestartInFlight) {
+                        IceRestartLogger.logSucceeded(
+                            System.currentTimeMillis() - firedAt, peerHex);
+                    }
                     if (status != CallStatus.ACTIVE) {
                         transitionTo(CallStatus.ACTIVE, null);
                         // Default speakerphone on for video calls — users
@@ -2310,12 +2756,52 @@ public class NativeVoiceCallManager {
                             }
                         }
                     }
-                } else if (newState == PeerConnection.IceConnectionState.FAILED
-                        || newState == PeerConnection.IceConnectionState.DISCONNECTED) {
-                    if (status == CallStatus.ACTIVE
-                        || status == CallStatus.CONNECTING) {
+                } else if (newState == PeerConnection.IceConnectionState.FAILED) {
+                    // FAILED handling per add-ice-restart-on-failed:
+                    //   - Post-restart FAILED → terminal (one-attempt cap).
+                    //   - Pre-setup statuses → terminal directly.
+                    //   - Live media sessions → attempt restart.
+                    cancelDisconnectedGraceTimer();
+                    if (iceRestartAttempted) {
+                        IceRestartLogger.logFailed(
+                            System.currentTimeMillis() - iceRestartFiredAtMs,
+                            IceRestartLogger.FAILURE_FAILED_STATE,
+                            peerHex);
+                        finishCall("ice-failed", /* sendHangup= */ false);
+                    } else if (status == CallStatus.CONNECTING
+                            || status == CallStatus.ACTIVE) {
+                        triggerIceRestart(IceRestartLogger.TRIGGER_FAILED);
+                    } else if (status == CallStatus.OUTGOING_RINGING
+                            || status == CallStatus.INCOMING_RINGING) {
+                        // Pre-setup failure — terminal directly per the
+                        // existing pre-setup behavior.
                         finishCall("ice-failed", /* sendHangup= */ false);
                     }
+                } else if (newState == PeerConnection.IceConnectionState.DISCONNECTED) {
+                    // Transient per the W3C spec: arm the grace timer
+                    // and surface "Reconnecting…" without ending the
+                    // call. Only applies to live media sessions.
+                    if (status != CallStatus.CONNECTING
+                            && status != CallStatus.ACTIVE) {
+                        return;
+                    }
+                    if (iceRestartAttempted) {
+                        // Restart in flight — UI already shows
+                        // reconnecting. Watchdog bounds the wait.
+                        return;
+                    }
+                    if (disconnectedGraceRunnable != null) {
+                        // Already armed; double-arming would extend
+                        // the window arbitrarily.
+                        return;
+                    }
+                    setConnectionQuality("reconnecting");
+                    disconnectedGraceRunnable = () -> {
+                        disconnectedGraceRunnable = null;
+                        triggerIceRestartFromGraceTimeout();
+                    };
+                    mainHandler.postDelayed(
+                        disconnectedGraceRunnable, ICE_DISCONNECTED_GRACE_MS);
                 }
             });
         }

@@ -26,6 +26,19 @@
     const isVideoCall = $derived($voiceCallState.callKind === 'video');
 
     const statusText = $derived.by(() => {
+        // Connection-quality override: surface "Reconnecting…" instead
+        // of the duration or connecting-spinner copy while ICE is
+        // disconnected within the grace window OR an ICE restart is
+        // in flight. Applies only to live media states; ended/ringing
+        // copy is preserved as-is. See
+        // openspec/changes/add-ice-restart-on-failed/.
+        if (
+            $voiceCallState.connectionQuality === 'reconnecting' &&
+            ($voiceCallState.status === 'connecting' ||
+                $voiceCallState.status === 'active')
+        ) {
+            return $t('voiceCall.reconnecting');
+        }
         switch ($voiceCallState.status) {
             case 'outgoing-ringing':
                 return isVideoCall ? $t('voiceCall.callingVideo') : $t('voiceCall.calling');

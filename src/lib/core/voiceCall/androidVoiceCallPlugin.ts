@@ -279,6 +279,20 @@ export interface AndroidVoiceCallPluginShape {
         eventName: 'callKindChanged',
         cb: (data: { callId: string; kind: 'voice' | 'video' }) => void
     ): Promise<PluginListenerHandle>;
+
+    /**
+     * Connection-quality signal — flips between {@code 'good'} and
+     * {@code 'reconnecting'} while ICE is transient-disconnected (within
+     * the grace window) OR while an ICE restart is in flight. The JS
+     * layer mirrors the value into
+     * {@code voiceCallState.connectionQuality} so the active-call UI
+     * can render the "Reconnecting…" pill. Part of
+     * {@code add-ice-restart-on-failed}.
+     */
+    addListener(
+        eventName: 'connectionQualityChanged',
+        cb: (data: { callId: string; quality: 'good' | 'reconnecting' }) => void
+    ): Promise<PluginListenerHandle>;
 }
 
 export const AndroidVoiceCall = registerPlugin<AndroidVoiceCallPluginShape>('AndroidVoiceCall');

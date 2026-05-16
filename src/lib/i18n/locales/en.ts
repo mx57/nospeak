@@ -532,6 +532,11 @@ const en = {
         endReasonError: 'Call failed',
         endReasonAnsweredElsewhere: 'Answered on another device',
         endReasonRejectedElsewhere: 'Declined on another device',
+        // Surfaced in ActiveCallOverlay while connectionQuality is
+        // 'reconnecting' (transient ICE disconnect within grace window
+        // OR an ICE restart is in flight). See
+        // openspec/changes/add-ice-restart-on-failed/.
+        reconnecting: 'Reconnecting\u2026',
         // Chat-history pill labels (CallEventMessage.svelte). Vocabulary
         // mirrors the live-overlay endReason* strings where the situation
         // is symmetric (call ended, connection failed). For asymmetric

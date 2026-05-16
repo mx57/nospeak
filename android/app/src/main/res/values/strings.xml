@@ -20,4 +20,10 @@
     <string name="bg_notif_location">📍 Location</string>
     <string name="bg_notif_new_encrypted_message">New encrypted message</string>
     <string name="bg_notif_open_to_read">You received a new message. Open nospeak to read it.</string>
+
+    <!-- Voice/video call surface — surfaced by ActiveCallActivity while
+         the call's connectionQuality is "reconnecting" (transient ICE
+         disconnect within the grace window OR an ICE restart is in
+         flight). See openspec/changes/add-ice-restart-on-failed/. -->
+    <string name="voice_call_reconnecting">Reconnecting…</string>
 </resources>
