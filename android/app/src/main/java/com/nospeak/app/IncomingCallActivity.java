@@ -176,9 +176,19 @@ public class IncomingCallActivity extends Activity {
         } else {
             getWindow().addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED |
-                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON |
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
         }
+        // FLAG_KEEP_SCREEN_ON has no Activity-method equivalent, so it
+        // must be applied as a window flag on every SDK level (the
+        // setShowWhenLocked/setTurnScreenOn pair above only replaces
+        // SHOW_WHEN_LOCKED/TURN_SCREEN_ON on API 27+). The incoming
+        // ringer should stay lit for the whole — bounded by
+        // RINGING_TIMEOUT_MS — ring so the user can see and answer the
+        // call, regardless of voice vs video. This also restores the
+        // assumption ProximityLockPolicy documents: the ringer's
+        // keep-screen-on takes priority over the (voice) proximity-off
+        // request the FGS holds during INCOMING_RINGING.
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     private void readExtras(Intent intent) {

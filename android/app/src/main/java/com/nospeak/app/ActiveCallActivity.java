@@ -404,6 +404,10 @@ public class ActiveCallActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         readExtras(intent);
+        // A replacement call may differ in kind from the previous one;
+        // this path does not call applyKindVisibility(), so re-evaluate
+        // the keep-screen-on flag directly against the new isVideoCall.
+        applyKeepScreenOn();
         // A second call replacing the first lands here. Re-bind the
         // avatar so the new peer's picture (or identicon) shows.
         bindAvatar();
@@ -552,8 +556,31 @@ public class ActiveCallActivity extends Activity {
         } else {
             getWindow().addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED |
-                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON |
-                WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON);
+        }
+        // Keep-screen-on is NOT applied here: there is no Activity-method
+        // equivalent for FLAG_KEEP_SCREEN_ON, and we only want it for
+        // video calls. It is driven by applyKeepScreenOn() from the
+        // points where isVideoCall is established/changed.
+    }
+
+    /**
+     * Hold {@code FLAG_KEEP_SCREEN_ON} for the duration of a video call
+     * so the display does not sleep on the system idle timeout while the
+     * user is watching remote video. This is the inverse of the
+     * proximity-lock policy ({@link ProximityLockPolicy}): proximity
+     * governs voice calls (screen off at the ear), keep-screen-on
+     * governs video calls (screen always on).
+     *
+     * <p>Window-flag mutation must run on the UI thread; every caller
+     * (onCreate, onNewIntent, applyKindVisibility — including the
+     * mid-call voice→video upgrade path) already runs there.
+     */
+    private void applyKeepScreenOn() {
+        if (isVideoCall) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         }
     }
 
@@ -659,6 +686,9 @@ public class ActiveCallActivity extends Activity {
         // animation) so the first frame doesn't slide in from a
         // half-applied XML margin.
         applyLocalPipBottomMargin(false);
+        // Hold the screen awake for video; release it for voice (the
+        // FGS proximity lock governs voice-call screen state instead).
+        applyKeepScreenOn();
     }
 
     /**
