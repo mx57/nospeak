@@ -13,6 +13,7 @@ build-android.sh
 push-and-deploy.sh
 nospeak-key.jks
 static/user_media
+tests
  
  # OS
 
