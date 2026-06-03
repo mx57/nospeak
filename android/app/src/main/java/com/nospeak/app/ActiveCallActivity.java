@@ -17,6 +17,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.Log;
 import android.util.TypedValue;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewOutlineProvider;
@@ -922,6 +923,7 @@ public class ActiveCallActivity extends Activity {
     private void wireButtons() {
         View.OnClickListener muteClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                performLightHaptic(v);
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr == null) return;
                 // Ask the manager for the current state instead of
@@ -932,12 +934,33 @@ public class ActiveCallActivity extends Activity {
         };
         View.OnClickListener hangupClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                // Destructive action: heavier haptic (matches Google
+                // Phone / Signal conventions for hangup) so the user
+                // feels the tap registered even when the relay round-
+                // trip delays the visible "Call ended" status text.
+                performHangupHaptic(v);
+                // Immediate visible confirmation: paint "Ending…" on
+                // the status line before mgr.hangup() runs through the
+                // relay publish + PC teardown. We do NOT update
+                // latestStatus — the manager remains the source of
+                // truth, and its subsequent ENDED callback will
+                // overwrite this transient label via applyStatus.
+                String endingText = getString(R.string.voice_call_ending);
+                if (statusView != null) statusView.setText(endingText);
+                if (statusViewVideo != null) statusViewVideo.setText(endingText);
+                // Disable both hangup buttons so a double-tap can't
+                // fire a redundant mgr.hangup() (idempotent, but the
+                // disabled state is a clearer "we got it" cue). The
+                // dimmed alpha matches the existing disabled-button
+                // visual used by refreshAddVideoButton.
+                disableHangupButtons();
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr != null) mgr.hangup();
             }
         };
         View.OnClickListener speakerClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                performLightHaptic(v);
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr == null) return;
                 // The visual update happens via the manager's
@@ -949,6 +972,7 @@ public class ActiveCallActivity extends Activity {
         };
         View.OnClickListener cameraOffClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                performLightHaptic(v);
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr == null) return;
                 mgr.setCameraOff(!mgr.isCameraOff());
@@ -956,12 +980,14 @@ public class ActiveCallActivity extends Activity {
         };
         View.OnClickListener cameraFlipClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                performLightHaptic(v);
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr != null) mgr.flipCamera();
             }
         };
         View.OnClickListener addVideoClick = new View.OnClickListener() {
             @Override public void onClick(View v) {
+                performLightHaptic(v);
                 NativeVoiceCallManager mgr = VoiceCallForegroundService.getNativeManager();
                 if (mgr != null) mgr.requestVideoUpgrade();
             }
@@ -989,6 +1015,60 @@ public class ActiveCallActivity extends Activity {
         applyMute(false);
         applySpeaker(false);
         applyCameraOff(false);
+    }
+
+    /**
+     * Short tactile pulse used for non-destructive call-control taps
+     * (mute, speaker, camera-off, camera-flip, add-video). Mirrors the
+     * convention used by the stock keyboard / lockscreen affordances.
+     *
+     * <p>{@link View#performHapticFeedback(int)} respects the user's
+     * system-wide "Touch feedback" setting and silently no-ops if it's
+     * disabled — no permission check or vibrator-capability probe
+     * needed.
+     */
+    private void performLightHaptic(View v) {
+        if (v == null) return;
+        try {
+            v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        } catch (Throwable ignored) {
+            // Some OEM ROMs throw on unsupported constants; safe to swallow.
+        }
+    }
+
+    /**
+     * Heavier haptic for destructive hangup taps. Matches the Google
+     * Phone / Signal "you just ended a call" feel — more emphatic than
+     * the standard virtual-key pulse so the user feels confident the
+     * tap registered even when the relay round-trip + PC teardown
+     * delays the visible state change.
+     */
+    private void performHangupHaptic(View v) {
+        if (v == null) return;
+        try {
+            v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Dim and disable both hangup buttons (voice-mode centered + video-
+     * mode bottom scrim). Called the moment a hangup tap is registered
+     * so accidental double-taps don't fire {@link NativeVoiceCallManager
+     * #hangup()} twice. The manager's {@code finishCall} is idempotent
+     * so the second call would be a no-op, but the disabled visual is
+     * a clearer "we got it" cue. The activity finishes via the
+     * {@code applyStatus(ENDED)} path ~1.5 s later so the button never
+     * needs to be re-enabled.
+     */
+    private void disableHangupButtons() {
+        if (hangupButton != null) {
+            hangupButton.setEnabled(false);
+            hangupButton.setAlpha(0.5f);
+        }
+        if (hangupButtonVideo != null) {
+            hangupButtonVideo.setEnabled(false);
+            hangupButtonVideo.setAlpha(0.5f);
+        }
     }
 
     private void initRenderersIfNeeded(NativeVoiceCallManager mgr) {

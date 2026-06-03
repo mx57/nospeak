@@ -8,6 +8,7 @@ node_modules
 /.svelte-kit
 /build
 .opencode
+.superpowers
 build-android.sh
 push-and-deploy.sh
 nospeak-key.jks

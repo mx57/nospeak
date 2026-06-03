@@ -1,5 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="oval">
-    <solid android:color="@color/incoming_call_accept" />
-</shape>
+<!--
+    Background for the call-accept button on the incoming ringer.
+    Solid green oval with a press-state ripple. See
+    bg_call_button_decline.xml for the structure rationale.
+-->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33FFFFFF">
+    <item android:id="@android:id/mask">
+        <shape android:shape="oval">
+            <solid android:color="#FFFFFFFF" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="@color/incoming_call_accept" />
+        </shape>
+    </item>
+</ripple>

@@ -13,6 +13,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.ImageButton;
@@ -240,15 +241,76 @@ public class IncomingCallActivity extends Activity {
         ImageButton accept = findViewById(R.id.incoming_call_accept);
         if (accept != null) {
             accept.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) { onAcceptClicked(); }
+                @Override public void onClick(View v) {
+                    // Haptic + disable-on-first-tap so the user gets
+                    // immediate physical feedback that the tap
+                    // registered AND can't accidentally fire the
+                    // accept path twice while the activity tears down.
+                    // VIRTUAL_KEY is the same short pulse the stock
+                    // dialer uses for non-destructive controls.
+                    performAcceptHaptic(v);
+                    disableRingerButtons();
+                    onAcceptClicked();
+                }
             });
         }
 
         ImageButton decline = findViewById(R.id.incoming_call_decline);
         if (decline != null) {
             decline.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) { onDeclineClicked(); }
+                @Override public void onClick(View v) {
+                    // Heavier haptic on decline to match the
+                    // destructive-action convention used by Google
+                    // Phone / Signal — pairs with the ripple background
+                    // for clear "rejected" feedback.
+                    performDeclineHaptic(v);
+                    disableRingerButtons();
+                    onDeclineClicked();
+                }
             });
+        }
+    }
+
+    /**
+     * Short tactile pulse for accept taps. Mirrors the keyboard /
+     * lockscreen convention. {@link View#performHapticFeedback(int)}
+     * respects the user's system "Touch feedback" setting and silently
+     * no-ops when disabled, so no permission probe is required.
+     */
+    private void performAcceptHaptic(View v) {
+        if (v == null) return;
+        try {
+            v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Heavier haptic for decline taps — destructive action convention.
+     */
+    private void performDeclineHaptic(View v) {
+        if (v == null) return;
+        try {
+            v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * Dim and disable the accept + decline buttons. Called on first
+     * tap so a double-tap can't fire the accept/decline handler twice
+     * while the activity is in the middle of finishing. The activity
+     * exits shortly after either tap so the buttons never need to be
+     * re-enabled.
+     */
+    private void disableRingerButtons() {
+        ImageButton accept = findViewById(R.id.incoming_call_accept);
+        if (accept != null) {
+            accept.setEnabled(false);
+            accept.setAlpha(0.5f);
+        }
+        ImageButton decline = findViewById(R.id.incoming_call_decline);
+        if (decline != null) {
+            decline.setEnabled(false);
+            decline.setAlpha(0.5f);
         }
     }
 

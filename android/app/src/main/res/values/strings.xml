@@ -26,4 +26,11 @@
          disconnect within the grace window OR an ICE restart is in
          flight). See openspec/changes/add-ice-restart-on-failed/. -->
     <string name="voice_call_reconnecting">Reconnecting…</string>
+    <!-- Transient label shown on the active-call status line the
+         moment the user taps the hangup button, before the manager's
+         ENDED status arrives and replaces it with "Call ended". Gives
+         immediate visible confirmation that the tap registered, in
+         addition to the haptic pulse and button-ripple. See
+         ActiveCallActivity.wireButtons hangup handler. -->
+    <string name="voice_call_ending">Ending…</string>
 </resources>

@@ -1,12 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Background for the active-call mute and speaker toggle buttons.
-    Translucent white circle that pops against the dark call
+    Background for the active-call mute / speaker / camera toggle
+    buttons. Translucent white circle that pops against the dark call
     background but is visually softer than the bright accept-green or
-    decline-red used for ringing actions. Phase 2 of
-    add-native-voice-calls.
+    decline-red used for ringing actions.
+
+    Wrapped in a <ripple> so every press shows a brief radial highlight
+    clipped to the oval bounds. Ripple color is white-on-translucent;
+    against the #33FFFFFF resting fill the API-21+ RippleDrawable
+    composite still reads as a brighter ring.
 -->
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="oval">
-    <solid android:color="#33FFFFFF" />
-</shape>
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="#33FFFFFF">
+    <item android:id="@android:id/mask">
+        <shape android:shape="oval">
+            <solid android:color="#FFFFFFFF" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="oval">
+            <solid android:color="#33FFFFFF" />
+        </shape>
+    </item>
+</ripple>
