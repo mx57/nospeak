@@ -1357,6 +1357,18 @@ export type AuthoredCallEventType =
 
     const isGroup = recipients.length > 1;
 
+    // Stamp the current group title onto chat/file messages so it survives a re-sync.
+    // A group's roster (and thus its id) is recoverable from any message's p-tags, but
+    // the title is local-only state with no authoritative metadata event. Carrying it on
+    // every kind-14/15 group message lets reconstruction (ensureGroupConversation) restore
+    // the title from whatever message survives on the relays. Must run before rumorId/seal.
+    if (isGroup && conversation?.subject && (rumor.kind === 14 || rumor.kind === 15)) {
+      const hasSubjectTag = (rumor.tags ?? []).some(t => Array.isArray(t) && t[0] === 'subject');
+      if (!hasSubjectTag) {
+        rumor.tags = [...(rumor.tags ?? []), ['subject', conversation.subject]];
+      }
+    }
+
     // Relay discovery (must happen before rumorId computation for NIP-17 relay hints)
     const senderRelays = await this.getMessagingRelays(senderNpub);
 

@@ -1017,6 +1017,174 @@ describe('MessagingService - Auto-add Contacts', () => {
         });
     });
 
+    describe('Group subject stamping (re-sync title persistence)', () => {
+        const senderPubkey = '79dff8f426826fdd7c32deb1d9e1f9c01234567890abcdef1234567890abcdef';
+
+        function setupGroupSend() {
+            const mockSigner = {
+                getPublicKey: vi.fn().mockResolvedValue(senderPubkey),
+                decrypt: vi.fn(),
+                encrypt: vi.fn().mockResolvedValue('ciphertext'),
+                signEvent: vi.fn().mockResolvedValue({}),
+            };
+            vi.mocked(get).mockReturnValue(mockSigner);
+
+            return import('./connection/publishWithDeadline').then(({ publishWithDeadline }) => {
+                vi.mocked(publishWithDeadline as any).mockResolvedValue({
+                    successfulRelays: ['wss://relay.test'],
+                    failedRelays: [],
+                    timedOutRelays: [],
+                });
+            });
+        }
+
+        function captureRumor(messaging: MessagingService): { current: any } {
+            const captured: { current: any } = { current: null };
+            vi.spyOn(messaging as any, 'createGiftWrap').mockImplementation(async (rumor: any) => {
+                if (!captured.current) captured.current = rumor;
+                return { id: 'gift-wrap-id', kind: 1059 } as any;
+            });
+            return captured;
+        }
+
+        const groupConversation = {
+            id: 'abcdef0123456789',
+            isGroup: true,
+            participants: ['npub1alice', 'npub1bob', 'npub1sender'],
+            subject: 'Weekend Trip',
+            lastActivityAt: 0,
+            createdAt: 0,
+        } as any;
+
+        it('stamps the conversation subject onto a group kind-14 message that has no subject tag', async () => {
+            await setupGroupSend();
+            const messaging = new MessagingService();
+            const captured = captureRumor(messaging);
+
+            const rumor = {
+                kind: 14,
+                pubkey: senderPubkey,
+                created_at: 1600000000,
+                content: 'hello group',
+                tags: [['p', 'alice-pubkey'], ['p', 'bob-pubkey']],
+            };
+
+            await (messaging as any).sendEnvelope({
+                recipients: ['npub1alice', 'npub1bob'],
+                rumor,
+                conversationId: groupConversation.id,
+                conversation: groupConversation,
+                messageDbFields: { message: 'hello group' },
+            });
+
+            const subjectTag = captured.current.tags.find((t: string[]) => t[0] === 'subject');
+            expect(subjectTag).toEqual(['subject', 'Weekend Trip']);
+        });
+
+        it('does not stamp a subject onto group reactions (kind 7)', async () => {
+            await setupGroupSend();
+            const messaging = new MessagingService();
+            const captured = captureRumor(messaging);
+
+            const rumor = {
+                kind: 7,
+                pubkey: senderPubkey,
+                created_at: 1600000000,
+                content: '+',
+                tags: [['p', 'alice-pubkey'], ['p', 'bob-pubkey']],
+            };
+
+            await (messaging as any).sendEnvelope({
+                recipients: ['npub1alice', 'npub1bob'],
+                rumor,
+                conversationId: groupConversation.id,
+                conversation: groupConversation,
+                skipDbSave: true,
+            });
+
+            const subjectTag = captured.current.tags.find((t: string[]) => t[0] === 'subject');
+            expect(subjectTag).toBeUndefined();
+        });
+
+        it('does not duplicate an explicit subject tag already on the rumor', async () => {
+            await setupGroupSend();
+            const messaging = new MessagingService();
+            const captured = captureRumor(messaging);
+
+            const rumor = {
+                kind: 14,
+                pubkey: senderPubkey,
+                created_at: 1600000000,
+                content: 'renamed',
+                tags: [['p', 'alice-pubkey'], ['p', 'bob-pubkey'], ['subject', 'New Name']],
+            };
+
+            await (messaging as any).sendEnvelope({
+                recipients: ['npub1alice', 'npub1bob'],
+                rumor,
+                conversationId: groupConversation.id,
+                conversation: groupConversation,
+                messageDbFields: { message: 'renamed' },
+            });
+
+            const subjectTags = captured.current.tags.filter((t: string[]) => t[0] === 'subject');
+            expect(subjectTags).toEqual([['subject', 'New Name']]);
+        });
+
+        it('does not stamp a subject onto 1-on-1 messages', async () => {
+            await setupGroupSend();
+            const messaging = new MessagingService();
+            const captured = captureRumor(messaging);
+
+            const rumor = {
+                kind: 14,
+                pubkey: senderPubkey,
+                created_at: 1600000000,
+                content: 'dm',
+                tags: [['p', 'alice-pubkey']],
+            };
+
+            await (messaging as any).sendEnvelope({
+                recipients: ['npub1alice'],
+                rumor,
+                messageDbFields: { message: 'dm' },
+            });
+
+            const subjectTag = captured.current.tags.find((t: string[]) => t[0] === 'subject');
+            expect(subjectTag).toBeUndefined();
+        });
+
+        it('reconstructs a new group conversation with the subject carried on an inbound rumor', async () => {
+            const { conversationRepo } = await import('$lib/db/ConversationRepository');
+            (conversationRepo as any).getConversation = vi.fn().mockResolvedValue(undefined);
+            const upsert = vi.fn().mockResolvedValue(undefined);
+            (conversationRepo as any).upsertConversation = upsert;
+
+            const messaging = new MessagingService();
+
+            const rumor = {
+                kind: 14,
+                pubkey: senderPubkey,
+                created_at: 1600000000,
+                content: 'hello group',
+                tags: [['p', 'alice-pubkey'], ['p', 'bob-pubkey'], ['subject', 'Weekend Trip']],
+            } as any;
+
+            await (messaging as any).ensureGroupConversation(
+                'abcdef0123456789',
+                ['npub1alice', 'npub1bob', 'npub1sender'],
+                rumor
+            );
+
+            expect(upsert).toHaveBeenCalledTimes(1);
+            expect(upsert.mock.calls[0][0]).toMatchObject({
+                id: 'abcdef0123456789',
+                isGroup: true,
+                subject: 'Weekend Trip',
+            });
+        });
+    });
+
     // NIP-40 voice-call signal expiration tests removed: NIP-AC no longer
     // uses NIP-40 expiration on signaling events. The ephemeral kind range
     // (21059 wrap, 25050-25054 inner) signals transience to relays, and
