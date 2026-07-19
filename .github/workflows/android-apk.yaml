@@ -14,11 +14,14 @@ jobs:
     permissions:
       contents: write # needed to upload assets to the release
     env:
-      # Gradle signing config expects these
+      # Gradle signing config expects these.
+      # TEST build: a self-signed keystore is generated on the fly below,
+      # so no repository secrets are required to produce a signed APK.
+      # Replace this block with real secrets for a production release.
       RELEASE_STORE_FILE: ../release.keystore
-      RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_STORE_PASSWORD }}
-      RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
-      RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+      RELEASE_STORE_PASSWORD: androidtest
+      RELEASE_KEY_ALIAS: nospeaktest
+      RELEASE_KEY_PASSWORD: androidtest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -64,12 +67,21 @@ jobs:
             echo "buildscript { repositories { google(); mavenCentral() } dependencies { classpath 'com.android.tools.build:gradle:8.13.0' } } apply plugin: 'com.android.library' android { namespace \"capacitor.android.plugins\" compileSdk 36 defaultConfig { minSdkVersion 24 targetSdkVersion 36 } }" > android/capacitor-cordova-android-plugins/build.gradle
             echo '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="capacitor.android.plugins"/>' > android/capacitor-cordova-android-plugins/src/main/AndroidManifest.xml
           fi
-      - name: Restore release keystore from secret
+      - name: Generate test (self-signed) release keystore
         working-directory: android/app
         run: |
-          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RELEASE_STORE_FILE"
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          # TEST build only: generate a throwaway self-signed keystore so the
+          # release APK can be signed without any repository secrets.
+          # For a real release, delete this step and restore the
+          # ANDROID_KEYSTORE_BASE64 secret + RELEASE_* secrets instead.
+          keytool -genkeypair -v \
+            -keystore "$RELEASE_STORE_FILE" \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias "$RELEASE_KEY_ALIAS" \
+            -storepass "$RELEASE_STORE_PASSWORD" \
+            -keypass "$RELEASE_KEY_PASSWORD" \
+            -dname "CN=nospeak-test, OU=test, O=nospeak, L=test, ST=test, C=US"
+          ls -la "$RELEASE_STORE_FILE"
       - name: Make Gradle wrapper executable
         run: chmod +x android/gradlew
       - name: Build signed release APK
