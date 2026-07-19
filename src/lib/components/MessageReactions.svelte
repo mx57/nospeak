@@ -4,7 +4,11 @@
     import { reactionsStore, type ReactionSummary } from '$lib/stores/reactions';
     import { blur } from '$lib/utils/platform';
 
-    let { targetEventId, isOwn = false } = $props<{ targetEventId: string; isOwn?: boolean }>();
+    let { targetEventId, isOwn = false, onReact } = $props<{
+        targetEventId: string;
+        isOwn?: boolean;
+        onReact?: (emoji: string) => void;
+    }>();
 
     let container: HTMLElement | null = null;
     let isVisible = $state(false);
@@ -59,15 +63,26 @@
     {#if isVisible && summaries.length > 0}
         <div class="flex flex-wrap gap-1 text-xs">
             {#each summaries as summary}
-                <div
-                    class={`inline-flex items-center px-1.5 py-0.5 rounded-full border text-[10px] shadow-sm ${blur('md')}
+                <button
+                    type="button"
+                    onclick={() => onReact?.(summary.emoji)}
+                    class={`
+                        inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-full border text-[10px] shadow-sm transition-all
+                        ${blur('md')}
                         border-gray-200/50 bg-white/90 text-gray-700 dark:border-slate-600/50 dark:bg-slate-800/90 dark:text-slate-200
-                        ${summary.byCurrentUser ? ' font-semibold ring-1 ring-offset-0 ' + (isOwn ? 'ring-blue-300 dark:ring-blue-600' : 'ring-gray-300 dark:ring-slate-500') : ''}`}
+                        ${summary.byCurrentUser
+                            ? 'font-semibold ring-1 ring-offset-0 ' + (isOwn ? 'ring-blue-300 dark:ring-blue-600' : 'ring-gray-300 dark:ring-slate-500')
+                            : ''}
+                        hover:bg-gray-100 dark:hover:bg-slate-700 active:scale-95 cursor-pointer
+                    `}
+                    aria-label={`${summary.emoji} ${summary.count}${summary.byCurrentUser ? ' (yours)' : ''}`}
                 >
                     <span>{summary.emoji}</span>
-                </div>
+                    {#if summary.count > 1}
+                        <span class="opacity-75">{summary.count}</span>
+                    {/if}
+                </button>
             {/each}
         </div>
     {/if}
 </div>
-
