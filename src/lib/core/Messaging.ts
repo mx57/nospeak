@@ -2026,7 +2026,7 @@ export type AuthoredCallEventType =
   public async sendReaction(
     recipientNpub: string,
     targetMessage: { recipientNpub: string; eventId: string; rumorId?: string; direction: 'sent' | 'received' },
-    emoji: '👍' | '❤️' | '😂' | '🙏' | '✓'
+    emoji: string
   ): Promise<void> {
     if (!targetMessage.rumorId) {
       console.warn('Cannot react to message without rumorId (likely old message)');
@@ -2076,10 +2076,61 @@ export type AuthoredCallEventType =
     reactionsStore.applyReactionUpdate(reaction);
   }
 
+  /**
+   * Remove a reaction (toggle off) — deletes from local DB.
+   * In the future we could also broadcast a kind-5 deletion event.
+   */
+  public async removeReaction(
+    recipientNpub: string,
+    targetMessage: { eventId: string; rumorId?: string; direction: 'sent' | 'received' },
+    emoji: string
+  ): Promise<void> {
+    if (!targetMessage.rumorId) {
+      console.warn('Cannot remove reaction without rumorId');
+      return;
+    }
+    const targetId = targetMessage.rumorId;
+
+    const s = get(signer);
+    if (!s) throw new Error('Not authenticated');
+    const senderPubkey = await s.getPublicKey();
+    const senderNpub = nip19.npubEncode(senderPubkey);
+
+    const deleted = await reactionRepo.deleteReaction(targetId, senderNpub, emoji);
+    if (deleted > 0) {
+      reactionsStore.removeReactionUpdate(targetId, senderNpub, emoji);
+    }
+  }
+
+  /**
+   * Remove a group reaction (toggle off).
+   */
+  public async removeGroupReaction(
+    conversationId: string,
+    targetMessage: { eventId: string; rumorId?: string; direction: 'sent' | 'received'; senderNpub?: string },
+    emoji: string
+  ): Promise<void> {
+    if (!targetMessage.rumorId) {
+      console.warn('Cannot remove group reaction without rumorId');
+      return;
+    }
+    const targetId = targetMessage.rumorId;
+
+    const s = get(signer);
+    if (!s) throw new Error('Not authenticated');
+    const senderPubkey = await s.getPublicKey();
+    const senderNpub = nip19.npubEncode(senderPubkey);
+
+    const deleted = await reactionRepo.deleteReaction(targetId, senderNpub, emoji);
+    if (deleted > 0) {
+      reactionsStore.removeReactionUpdate(targetId, senderNpub, emoji);
+    }
+  }
+
   public async sendGroupReaction(
     conversationId: string,
     targetMessage: { eventId: string; rumorId?: string; direction: 'sent' | 'received'; senderNpub?: string },
-    emoji: '👍' | '❤️' | '😂' | '🙏' | '✓'
+    emoji: string
   ): Promise<void> {
     if (!targetMessage.rumorId) {
       console.warn('Cannot react to message without rumorId (likely old message)');

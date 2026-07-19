@@ -98,10 +98,47 @@ function createReactionsStore() {
         });
     }
 
+    function removeReactionUpdate(targetEventId: string, authorNpub: string, emoji: string): void {
+        update(state => {
+            const existing = state[targetEventId];
+            if (!existing) return state;
+
+            const map = new Map<string, { count: number; byCurrentUser: boolean }>();
+            for (const summary of existing) {
+                if (summary.emoji === emoji) {
+                    // Decrement or remove
+                    const newCount = summary.count - 1;
+                    if (newCount <= 0) continue; // remove entry entirely
+                    map.set(summary.emoji, {
+                        count: newCount,
+                        byCurrentUser: summary.byCurrentUser && summary.count > 1 ? false : summary.byCurrentUser
+                    });
+                } else {
+                    map.set(summary.emoji, {
+                        count: summary.count,
+                        byCurrentUser: summary.byCurrentUser
+                    });
+                }
+            }
+
+            const summaries: ReactionSummary[] = Array.from(map.entries()).map(([emoji, value]) => ({
+                emoji,
+                count: value.count,
+                byCurrentUser: value.byCurrentUser
+            }));
+
+            return {
+                ...state,
+                [targetEventId]: summaries
+            };
+        });
+    }
+
     return {
         subscribe: subscribe as Readable<InternalState>['subscribe'],
         refreshSummariesForTarget,
         applyReactionUpdate,
+        removeReactionUpdate,
         subscribeToMessageReactions
     };
 }

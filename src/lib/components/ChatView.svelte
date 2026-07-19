@@ -32,6 +32,7 @@ import { overscroll } from '$lib/utils/overscroll';
 import { navigateWithTransition } from '$lib/utils/viewTransition';
   import { lastRelaySendStatus, clearRelayStatus } from '$lib/stores/sending';
   import { readReceiptsStore, updateReadReceipt } from '$lib/stores/readReceipts';
+  import { reactionsStore } from '$lib/stores/reactions';
   import { reactionRepo } from '$lib/db/ReactionRepository';
   import { openProfileModal } from '$lib/stores/modals';
   import { openImageViewer } from '$lib/stores/imageViewer';
@@ -1843,7 +1844,7 @@ import { navigateWithTransition } from '$lib/utils/viewTransition';
     };
   }
 
-  async function reactToMessage(emoji: '👍' | '❤️' | '😂' | '🙏') {
+  async function reactToMessage(emoji: string) {
     if (!contextMenu.message) return;
     // For 1-on-1 chats, need partnerNpub; for groups, need groupConversation
     if (!isGroup && !partnerNpub) return;
@@ -1859,31 +1860,62 @@ import { navigateWithTransition } from '$lib/utils/viewTransition';
       return;
     }
 
+    // Toggle: if current user already has this reaction, remove it
+    const rumorId = contextMenu.message.rumorId;
+    const targetReactions = $reactionsStore[rumorId];
+    const existingForEmoji = targetReactions?.find(s => s.emoji === emoji);
+    const shouldRemove = existingForEmoji?.byCurrentUser === true;
+
     try {
-      if (isGroup && groupConversation) {
-        // Group chat: send reaction to all participants
-        await messagingService.sendGroupReaction(
-          groupConversation.id,
-          {
-            eventId: contextMenu.message.eventId,
-            rumorId: contextMenu.message.rumorId,
-            direction: contextMenu.message.direction,
-            senderNpub: contextMenu.message.senderNpub
-          },
-          emoji
-        );
+      if (shouldRemove) {
+        if (isGroup && groupConversation) {
+          await messagingService.removeGroupReaction(
+            groupConversation.id,
+            {
+              eventId: contextMenu.message.eventId,
+              rumorId,
+              direction: contextMenu.message.direction,
+              senderNpub: contextMenu.message.senderNpub
+            },
+            emoji
+          );
+        } else {
+          await messagingService.removeReaction(
+            partnerNpub!,
+            {
+              eventId: contextMenu.message.eventId,
+              rumorId,
+              direction: contextMenu.message.direction
+            },
+            emoji
+          );
+        }
       } else {
-        // 1-on-1 chat: send reaction to single recipient
-        await messagingService.sendReaction(
-          partnerNpub!,
-          {
-            recipientNpub: contextMenu.message.recipientNpub,
-            eventId: contextMenu.message.eventId,
-            rumorId: contextMenu.message.rumorId,
-            direction: contextMenu.message.direction
-          },
-          emoji
-        );
+        if (isGroup && groupConversation) {
+          // Group chat: send reaction to all participants
+          await messagingService.sendGroupReaction(
+            groupConversation.id,
+            {
+              eventId: contextMenu.message.eventId,
+              rumorId,
+              direction: contextMenu.message.direction,
+              senderNpub: contextMenu.message.senderNpub
+            },
+            emoji
+          );
+        } else {
+          // 1-on-1 chat: send reaction to single recipient
+          await messagingService.sendReaction(
+            partnerNpub!,
+            {
+              recipientNpub: contextMenu.message.recipientNpub,
+              eventId: contextMenu.message.eventId,
+              rumorId,
+              direction: contextMenu.message.direction
+            },
+            emoji
+          );
+        }
       }
     } catch (e) {
       console.error('Failed to send reaction:', e);
@@ -2544,6 +2576,7 @@ import { navigateWithTransition } from '$lib/utils/viewTransition';
         <MessageReactions
           targetEventId={msg.rumorId || ''}
           isOwn={msg.direction === "sent"}
+          onReact={(emoji) => reactToMessage(emoji)}
         />
         </div>
 
