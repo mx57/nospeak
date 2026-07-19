@@ -6,13 +6,16 @@ on:
         description: 'Version tag (e.g. v1.0.0). Leave empty to use latest git tag.'
         required: false
         default: ''
+  push:
+    tags:
+      - 'v*'
   release:
     types: [published]
 jobs:
   build-signed-release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # needed to upload assets to the release
+      contents: write # needed to upload assets / create release
     env:
       # Gradle signing config expects these.
       # TEST build: a self-signed keystore is generated on the fly below,
@@ -30,6 +33,9 @@ jobs:
       - name: Determine version tag
         run: |
           TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ] && [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
           if [ -z "$TAG" ]; then
             TAG="${{ github.event.inputs.tag }}"
           fi
@@ -90,18 +96,31 @@ jobs:
       - name: Rename APK with release tag
         working-directory: android
         run: |
-          VERSION="${RELEASE_TAG#v}"  # strips leading 'v' if present
           SRC="app/build/outputs/apk/release/app-release.apk"
           DST="app/build/outputs/apk/release/nospeak.apk"
           cp "$SRC" "$DST"
       - name: Upload APK as workflow artifact
-        if: github.event_name != 'release'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: nospeak-apk
           path: android/app/build/outputs/apk/release/nospeak.apk
-      - name: Attach APK to GitHub Release
+      - name: Create/Update GitHub Release and attach APK
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'release' && github.event.action == 'published'
+        if: github.event_name == 'release' || github.event_name == 'push'
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          body: |
+            ## nospeak ${{ env.RELEASE_TAG }}
+
+            Auto-built from tag [`${{ env.RELEASE_TAG }}`](https://github.com/${{ github.repository }}/tree/${{ env.RELEASE_TAG }}).
+
+            ### What's new
+            See the [changelog](https://github.com/${{ github.repository }}/releases/tag/${{ env.RELEASE_TAG }}) for details.
+
+            ### Download
+            - **APK**: `nospeak.apk` attached below
+          draft: ${{ github.event_name == 'push' }}
+          prerelease: false
           files: android/app/build/outputs/apk/release/nospeak.apk
